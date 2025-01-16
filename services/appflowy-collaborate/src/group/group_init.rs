@@ -924,6 +924,8 @@ impl CollabPersister {
     let len = update.len();
     // send updates to redis queue
     let update = CollabStreamUpdate::new(update, sender, UpdateFlags::default());
+    let new_update = update.into_new_update().unwrap();
+    tracing::info!("{:?}", new_update);
     let msg_id = self.update_sink.send(&update).await?;
     tracing::trace!(
       "persisted update from {} ({} bytes) - msg id: {}",

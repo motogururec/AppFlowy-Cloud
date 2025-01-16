@@ -117,7 +117,7 @@ async fn open_app_handler(
   session: UserSession,
 ) -> Result<axum::response::Response, WebApiError<'static>> {
   let app_sign_in_url = format!(
-      "appflowy-flutter://login-callback#access_token={}&expires_at={}&expires_in={}&refresh_token={}&token_type={}",
+      "appflowy-flutter://login-callback?access_token={}&expires_at={}&expires_in={}&refresh_token={}&token_type={}",
         session.token.access_token,
         session.token.expires_at,
         session.token.expires_in,

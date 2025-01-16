@@ -404,6 +404,20 @@ impl CollabStreamUpdate {
     };
     Ok(update)
   }
+
+  pub fn into_new_update(&self) -> Result<collab::preclude::Update, StreamError> {
+    let bytes = if self.flags.is_compressed() {
+      zstd::decode_all(std::io::Cursor::new(self.data.clone()))?
+    } else {
+      self.data.clone()
+    };
+    let update = if self.flags.is_v1_encoded() {
+      collab::preclude::Update::decode_v1(&bytes)?
+    } else {
+      collab::preclude::Update::decode_v2(&bytes)?
+    };
+    Ok(update)
+  }
 }
 
 impl TryFrom<HashMap<String, redis::Value>> for CollabStreamUpdate {
