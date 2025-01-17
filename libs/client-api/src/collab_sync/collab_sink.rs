@@ -129,6 +129,7 @@ where
     let _ = self.sync_state_tx.send(CollabSyncState::Syncing);
     let mut msg_queue = self.message_queue.lock();
     let msg_id = self.state.id_counter.next();
+    info!("queing update: {}", msg_id);
     let new_msg = f(msg_id);
     msg_queue.push_msg(msg_id, new_msg);
     drop(msg_queue);
