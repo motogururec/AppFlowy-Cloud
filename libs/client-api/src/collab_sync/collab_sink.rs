@@ -11,7 +11,7 @@ use collab::lock::Mutex;
 use futures_util::SinkExt;
 use tokio::sync::{broadcast, watch};
 use tokio::time::{interval, sleep};
-use tracing::{error, trace, warn};
+use tracing::{error, info, trace, warn};
 
 use crate::collab_sync::collab_stream::SeqNumCounter;
 use crate::collab_sync::{SinkConfig, SyncError, SyncObject};
@@ -294,6 +294,14 @@ where
       };
       get_next_batch_item(&self.state, &mut sending_messages, &mut msg_queue)
     };
+    info!(
+      "process_next_msg: {:?}",
+      items
+        .clone()
+        .iter()
+        .map(|item| item.msg_id())
+        .collect::<Vec<_>>()
+    );
     self.send_immediately(items).await;
   }
 
