@@ -40,6 +40,10 @@ impl ClientCollabMessage {
     Self::ClientUpdateSync { data }
   }
 
+  pub fn new_awareness_sync(data: UpdateSync) -> Self {
+    Self::ClientAwarenessSync(data)
+  }
+
   pub fn new_server_init_sync(data: ServerInit) -> Self {
     Self::ServerInitSync(data)
   }

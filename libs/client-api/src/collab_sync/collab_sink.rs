@@ -372,6 +372,7 @@ where
           if !sending_messages.contains(&last.msg_id())
             && last.message().payload_size() < self.config.maximum_payload_size
             && last.mergeable()
+            && next.mergeable()
             && last.merge(&next, &self.config.maximum_payload_size).is_ok()
           {
             merged_ids
