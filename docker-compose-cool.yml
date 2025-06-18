@@ -4,8 +4,9 @@ services:
   nginx:
     restart: on-failure
     image: nginx
-    ports: [] # <--- No empty line directly after this line
-    volumes: # <--- This line should be indented exactly like 'ports:'
+    ports:
+      - "80/tcp" # <--- Try this. It explicitly states an internal container port.
+    volumes:
       - ./nginx/nginx.conf:/etc/nginx/nginx.conf
       - ./nginx/ssl/certificate.crt:/etc/nginx/ssl/certificate.crt
       - ./nginx/ssl/private_key.key:/etc/nginx/ssl/private_key.key
