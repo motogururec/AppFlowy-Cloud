@@ -1,8 +1,9 @@
 use app_error::AppError;
 use appflowy_collaborate::collab::storage::CollabAccessControlStorage;
-use collab::core::collab::DataSource;
+use collab::core::collab::{default_client_id, CollabOptions, DataSource};
 use collab::preclude::Collab;
 use collab_database::database::DatabaseBody;
+use collab_database::database_trait::NoPersistenceDatabaseCollabService;
 use collab_database::entity::FieldType;
 use collab_database::fields::type_option_cell_reader;
 use collab_database::fields::type_option_cell_writer;
@@ -18,7 +19,6 @@ use collab_database::rows::RowDetail;
 use collab_database::rows::RowId;
 use collab_database::rows::RowMetaKey;
 use collab_database::template::timestamp_parse::TimestampCellData;
-use collab_database::workspace_database::NoPersistenceDatabaseCollabService;
 use collab_database::workspace_database::WorkspaceDatabaseBody;
 use collab_document::document::Document;
 use collab_document::importer::md_importer::MDImporter;
@@ -38,12 +38,15 @@ use sqlx::PgPool;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
+use tracing::{instrument, trace};
 use uuid::Uuid;
+use yrs::block::ClientID;
 use yrs::Map;
 
 pub const DEFAULT_SPACE_ICON: &str = "interface_essential/home-3";
 pub const DEFAULT_SPACE_ICON_COLOR: &str = "0xFFA34AFD";
 
+#[instrument(level = "debug", skip_all)]
 pub fn get_row_details_serde(
   row_detail: RowDetail,
   field_by_id_name_uniq: &HashMap<String, Field>,
@@ -52,6 +55,13 @@ pub fn get_row_details_serde(
   let mut cells = row_detail.row.cells;
   let mut row_details_serde: HashMap<String, serde_json::Value> =
     HashMap::with_capacity(cells.len());
+
+  trace!(
+    "get_row_details_serde: row_id: {}, cells: {:#?}, field_by_id_name_uniq: {:#?}",
+    row_detail.row.id,
+    cells,
+    field_by_id_name_uniq
+  );
   for (field_id, field) in field_by_id_name_uniq {
     let cell: Cell = match cells.remove(field_id) {
       Some(cell) => cell.clone(),
@@ -196,23 +206,23 @@ pub fn type_options_serde(
 
 pub async fn get_latest_collab_database_row_body(
   collab_storage: &CollabAccessControlStorage,
-  workspace_uuid_str: &str,
-  db_row_uuid_str: &str,
+  workspace_id: Uuid,
+  db_row_id: Uuid,
 ) -> Result<(Collab, DatabaseRowBody), AppError> {
   let mut db_row_collab = get_latest_collab(
     collab_storage,
     GetCollabOrigin::Server,
-    workspace_uuid_str,
-    db_row_uuid_str,
+    workspace_id,
+    db_row_id,
     CollabType::DatabaseRow,
   )
   .await?;
 
-  let row_id: RowId = db_row_uuid_str.to_string().into();
+  let row_id: RowId = db_row_id.to_string().into();
   let db_row_body = DatabaseRowBody::open(row_id, &mut db_row_collab).map_err(|err| {
     AppError::Internal(anyhow::anyhow!(
       "Failed to create database row body from collab, db_row_id: {}, err: {}",
-      db_row_uuid_str,
+      db_row_id,
       err
     ))
   })?;
@@ -222,45 +232,49 @@ pub async fn get_latest_collab_database_row_body(
 
 pub async fn get_latest_collab_database_body(
   collab_storage: &CollabAccessControlStorage,
-  workspace_uuid_str: &str,
-  database_uuid_str: &str,
+  workspace_id: Uuid,
+  database_id: Uuid,
 ) -> Result<(Collab, DatabaseBody), AppError> {
   let db_collab = get_latest_collab(
     collab_storage,
     GetCollabOrigin::Server,
-    workspace_uuid_str,
-    database_uuid_str,
+    workspace_id,
+    database_id,
     CollabType::Database,
   )
   .await?;
-  let db_body = DatabaseBody::from_collab(
-    &db_collab,
-    Arc::new(NoPersistenceDatabaseCollabService),
-    None,
-  )
-  .ok_or_else(|| {
-    AppError::Internal(anyhow::anyhow!(
-      "Failed to create database body from collab, db_collab_id: {}",
-      database_uuid_str,
-    ))
-  })?;
-  Ok((db_collab, db_body))
+
+  tokio::task::spawn_blocking(move || {
+    let db_body = DatabaseBody::from_collab(
+      &db_collab,
+      Arc::new(NoPersistenceDatabaseCollabService::new(default_client_id())),
+      None,
+    )
+    .ok_or_else(|| {
+      AppError::Internal(anyhow::anyhow!(
+        "Failed to create database body from collab, db_collab_id: {}",
+        database_id,
+      ))
+    })?;
+    Ok((db_collab, db_body))
+  })
+  .await?
 }
 
 pub async fn get_latest_collab_encoded(
   collab_storage: &CollabAccessControlStorage,
   collab_origin: GetCollabOrigin,
-  workspace_id: &str,
-  oid: &str,
+  workspace_id: Uuid,
+  object_id: Uuid,
   collab_type: CollabType,
 ) -> Result<EncodedCollab, AppError> {
   collab_storage
-    .get_encode_collab(
+    .get_full_encode_collab(
       collab_origin,
       QueryCollabParams {
-        workspace_id: workspace_id.to_string(),
+        workspace_id,
         inner: QueryCollab {
-          object_id: oid.to_string(),
+          object_id,
           collab_type,
         },
       },
@@ -272,10 +286,10 @@ pub async fn get_latest_collab_encoded(
 pub async fn batch_get_latest_collab_encoded(
   collab_storage: &CollabAccessControlStorage,
   collab_origin: GetCollabOrigin,
-  workspace_id: &str,
-  oid_list: &[String],
+  workspace_id: Uuid,
+  oid_list: &[Uuid],
   collab_type: CollabType,
-) -> Result<HashMap<String, EncodedCollab>, AppError> {
+) -> Result<HashMap<Uuid, EncodedCollab>, AppError> {
   let uid = match collab_origin {
     GetCollabOrigin::User { uid } => uid,
     _ => 0,
@@ -283,15 +297,15 @@ pub async fn batch_get_latest_collab_encoded(
   let queries: Vec<QueryCollab> = oid_list
     .iter()
     .map(|row_id| QueryCollab {
-      object_id: row_id.to_string(),
-      collab_type: collab_type.clone(),
+      object_id: *row_id,
+      collab_type,
     })
     .collect();
   let query_collab_results = collab_storage
-    .batch_get_collab(&uid, workspace_id, queries, true)
+    .batch_get_collab(&uid, workspace_id, queries)
     .await;
   let encoded_collabs = tokio::task::spawn_blocking(move || {
-    let collabs: HashMap<String, EncodedCollab> = query_collab_results
+    let collabs: HashMap<_, EncodedCollab> = query_collab_results
       .into_par_iter()
       .filter_map(|(oid, query_collab_result)| match query_collab_result {
         QueryCollabResult::Success { encode_collab_v1 } => {
@@ -319,18 +333,19 @@ pub async fn batch_get_latest_collab_encoded(
 pub async fn get_latest_collab(
   storage: &CollabAccessControlStorage,
   origin: GetCollabOrigin,
-  workspace_id: &str,
-  oid: &str,
+  workspace_id: Uuid,
+  oid: Uuid,
   collab_type: CollabType,
 ) -> Result<Collab, AppError> {
   let ec = get_latest_collab_encoded(storage, origin, workspace_id, oid, collab_type).await?;
-  let collab: Collab = Collab::new_with_source(CollabOrigin::Server, oid, ec.into(), vec![], false)
-    .map_err(|e| {
-      AppError::Internal(anyhow::anyhow!(
-        "Failed to create collab from encoded collab: {:?}",
-        e
-      ))
-    })?;
+  let options =
+    CollabOptions::new(oid.to_string(), default_client_id()).with_data_source(ec.into());
+  let collab = Collab::new_with_options(CollabOrigin::Server, options).map_err(|e| {
+    AppError::Internal(anyhow::anyhow!(
+      "Failed to create collab from encoded collab: {:?}",
+      e
+    ))
+  })?;
   Ok(collab)
 }
 
@@ -338,15 +353,14 @@ pub async fn get_latest_collab_workspace_database_body(
   pg_pool: &PgPool,
   storage: &CollabAccessControlStorage,
   origin: GetCollabOrigin,
-  workspace_id: &str,
+  workspace_id: Uuid,
 ) -> Result<WorkspaceDatabaseBody, AppError> {
-  let workspace_uuid = Uuid::parse_str(workspace_id)?;
-  let ws_db_oid = select_workspace_database_oid(pg_pool, &workspace_uuid).await?;
+  let ws_db_oid = select_workspace_database_oid(pg_pool, &workspace_id).await?;
   let mut collab = get_latest_collab(
     storage,
     origin,
     workspace_id,
-    &ws_db_oid,
+    ws_db_oid,
     CollabType::WorkspaceDatabase,
   )
   .await?;
@@ -362,7 +376,8 @@ pub async fn get_latest_collab_workspace_database_body(
 pub async fn get_latest_collab_folder(
   collab_storage: &CollabAccessControlStorage,
   collab_origin: GetCollabOrigin,
-  workspace_id: &str,
+  workspace_id: Uuid,
+  client_id: ClientID,
 ) -> Result<Folder, AppError> {
   let folder_uid = if let GetCollabOrigin::User { uid } = collab_origin {
     uid
@@ -385,28 +400,33 @@ pub async fn get_latest_collab_folder(
       err
     ))
   })?;
-  let folder = Folder::from_collab_doc_state(
-    folder_uid,
-    CollabOrigin::Server,
-    encoded_collab.into(),
-    workspace_id,
-    vec![],
-  )
-  .map_err(|e| {
-    AppError::Internal(anyhow::anyhow!(
-      "Unable to decode workspace folder {}: {}",
-      workspace_id,
-      e
-    ))
-  })?;
+
+  let folder = tokio::task::spawn_blocking(move || {
+    Folder::from_collab_doc_state(
+      folder_uid,
+      CollabOrigin::Server,
+      encoded_collab.into(),
+      &workspace_id.to_string(),
+      client_id,
+    )
+    .map_err(|e| {
+      AppError::Internal(anyhow::anyhow!(
+        "Unable to decode workspace folder {}: {}",
+        workspace_id,
+        e
+      ))
+    })
+  })
+  .await??;
+
   Ok(folder)
 }
 
 pub async fn get_latest_collab_document(
   collab_storage: &CollabAccessControlStorage,
   collab_origin: GetCollabOrigin,
-  workspace_id: &str,
-  doc_oid: &str,
+  workspace_id: Uuid,
+  doc_oid: Uuid,
 ) -> Result<Document, AppError> {
   let doc_collab = get_latest_collab(
     collab_storage,
@@ -451,20 +471,21 @@ pub async fn collab_to_doc_state(
   .await?
 }
 
-pub fn collab_from_doc_state(doc_state: Vec<u8>, object_id: &str) -> Result<Collab, AppError> {
-  let collab = Collab::new_with_source(
-    CollabOrigin::Server,
-    object_id,
-    DataSource::DocStateV1(doc_state),
-    vec![],
-    false,
-  )
-  .map_err(|e| AppError::Unhandled(e.to_string()))?;
+pub fn collab_from_doc_state(
+  doc_state: Vec<u8>,
+  object_id: &Uuid,
+  client_id: ClientID,
+) -> Result<Collab, AppError> {
+  let options = CollabOptions::new(object_id.to_string(), client_id)
+    .with_data_source(DataSource::DocStateV1(doc_state));
+  let collab = Collab::new_with_options(CollabOrigin::Server, options)
+    .map_err(|e| AppError::Unhandled(e.to_string()))?;
   Ok(collab)
 }
 
 /// Base on values given by [cell_value_by_id], write to fields of DatabaseRowBody.
 /// Returns encoded collab updates to the database row
+#[instrument(level = "debug", skip_all)]
 pub async fn write_to_database_row(
   db_body: &DatabaseBody,
   db_row_txn: &mut yrs::TransactionMut<'_>,
@@ -485,6 +506,12 @@ pub async fn write_to_database_row(
     row_update.set_last_modified(modified_ts);
   });
 
+  trace!(
+    "insert {} cells, {} fields. values: {:#?}",
+    cell_value_by_id.len(),
+    field_by_id.len(),
+    cell_value_by_id
+  );
   // for each field given by user input, overwrite existing data
   for (id, serde_val) in cell_value_by_id {
     let field = match field_by_id.get(&id) {
@@ -506,6 +533,11 @@ pub async fn write_to_database_row(
       },
     };
     let new_cell: Cell = cell_writer.convert_json_to_cell(serde_val);
+    trace!(
+      "Writing cell for field: {}, value: {:?}",
+      field.id,
+      new_cell,
+    );
     db_row_body.update(db_row_txn, |row_update| {
       row_update.update_cells(|cells_update| {
         cells_update.insert_cell(&field.id, new_cell);
@@ -516,42 +548,50 @@ pub async fn write_to_database_row(
 }
 
 pub async fn create_row_document(
-  workspace_id: &str,
+  workspace_id: Uuid,
   uid: i64,
-  new_doc_id: &str,
+  new_doc_id: Uuid,
   collab_storage: &CollabAccessControlStorage,
   row_doc_content: String,
 ) -> Result<CreatedRowDocument, AppError> {
   let md_importer = MDImporter::new(None);
+  let client_id = default_client_id();
+  let new_doc_id_str = new_doc_id.to_string();
   let doc_data = md_importer
-    .import(new_doc_id, row_doc_content)
+    .import(&new_doc_id_str, row_doc_content)
     .map_err(|e| AppError::Internal(anyhow::anyhow!("Failed to import markdown: {:?}", e)))?;
-  let doc = Document::create(new_doc_id, doc_data)
+  let doc = Document::create(&new_doc_id_str, doc_data, client_id)
     .map_err(|e| AppError::Internal(anyhow::anyhow!("Failed to create document: {:?}", e)))?;
   let doc_ec = doc.encode_collab().map_err(|e| {
     AppError::Internal(anyhow::anyhow!("Failed to encode document collab: {:?}", e))
   })?;
 
-  let mut folder =
-    get_latest_collab_folder(collab_storage, GetCollabOrigin::Server, workspace_id).await?;
+  let mut folder = get_latest_collab_folder(
+    collab_storage,
+    GetCollabOrigin::Server,
+    workspace_id,
+    client_id,
+  )
+  .await?;
   let folder_updates = {
     let mut folder_txn = folder.collab.transact_mut();
     folder.body.views.insert(
       &mut folder_txn,
-      collab_folder::View::orphan_view(new_doc_id, collab_folder::ViewLayout::Document, Some(uid)),
+      collab_folder::View::orphan_view(
+        &new_doc_id_str,
+        collab_folder::ViewLayout::Document,
+        Some(uid),
+      ),
       None,
     );
     folder_txn.encode_update_v1()
   };
-
-  let updated_folder = collab_to_bin(folder.collab, CollabType::Folder).await?;
 
   let doc_ec_bytes = doc_ec
     .encode_to_bytes()
     .map_err(|e| AppError::Internal(anyhow::anyhow!("Failed to encode db doc: {:?}", e)))?;
 
   Ok(CreatedRowDocument {
-    updated_folder,
     folder_updates,
     doc_ec_bytes,
   })
@@ -564,13 +604,13 @@ pub enum DocChanges {
 
 pub async fn get_database_row_doc_changes(
   collab_storage: &CollabAccessControlStorage,
-  workspace_uuid_str: &str,
+  workspace_id: Uuid,
   row_doc_content: Option<String>,
   db_row_body: &DatabaseRowBody,
   db_row_txn: &mut yrs::TransactionMut<'_>,
-  row_id: &str,
+  row_id: &Uuid,
   uid: i64,
-) -> Result<Option<(String, DocChanges)>, AppError> {
+) -> Result<Option<(Uuid, DocChanges)>, AppError> {
   let row_doc_content = match row_doc_content {
     Some(row_doc_content) if !row_doc_content.is_empty() => row_doc_content,
     _ => return Ok(None),
@@ -582,11 +622,12 @@ pub async fn get_database_row_doc_changes(
 
   match doc_id {
     Some(doc_id) => {
+      let doc_uuid = Uuid::parse_str(&doc_id)?;
       let cur_doc = get_latest_collab_document(
         collab_storage,
         GetCollabOrigin::Server,
-        workspace_uuid_str,
-        &doc_id,
+        workspace_id,
+        doc_uuid,
       )
       .await?;
 
@@ -594,13 +635,11 @@ pub async fn get_database_row_doc_changes(
       let new_doc_data = md_importer
         .import(&doc_id, row_doc_content)
         .map_err(|e| AppError::Internal(anyhow::anyhow!("Failed to import markdown: {:?}", e)))?;
-      let new_doc = Document::create(&doc_id, new_doc_data)
+      let new_doc = Document::create(&doc_id, new_doc_data, default_client_id())
         .map_err(|e| AppError::Internal(anyhow::anyhow!("Failed to create document: {:?}", e)))?;
 
       // if the document content is the same, there is no need to update
-      if cur_doc.to_plain_text(false, false).unwrap_or_default()
-        == new_doc.to_plain_text(false, false).unwrap_or_default()
-      {
+      if cur_doc.paragraphs() == new_doc.paragraphs() {
         return Ok(None);
       };
 
@@ -623,11 +662,14 @@ pub async fn get_database_row_doc_changes(
       }
 
       let updated_doc = collab_to_bin(cur_doc_collab, CollabType::Document).await?;
-      Ok(Some((doc_id, DocChanges::Update(updated_doc, doc_update))))
+      Ok(Some((
+        doc_uuid,
+        DocChanges::Update(updated_doc, doc_update),
+      )))
     },
     None => {
       // update row to indicate that the document is not empty
-      let is_document_empty_id = meta_id_from_row_id(&row_id.parse()?, RowMetaKey::IsDocumentEmpty);
+      let is_document_empty_id = meta_id_from_row_id(row_id, RowMetaKey::IsDocumentEmpty);
       db_row_body
         .get_meta()
         .insert(db_row_txn, is_document_empty_id, false);
@@ -638,10 +680,11 @@ pub async fn get_database_row_doc_changes(
         .map_err(|err| AppError::Internal(anyhow::anyhow!("Failed to get document id: {:?}", err)))?
         .ok_or_else(|| AppError::Internal(anyhow::anyhow!("Failed to get document id")))?;
 
+      let new_doc_id = Uuid::parse_str(&new_doc_id)?;
       let created_row_doc: CreatedRowDocument = create_row_document(
-        workspace_uuid_str,
+        workspace_id,
         uid,
-        &new_doc_id,
+        new_doc_id,
         collab_storage,
         row_doc_content,
       )
@@ -652,7 +695,7 @@ pub async fn get_database_row_doc_changes(
 }
 
 pub struct CreatedRowDocument {
-  pub updated_folder: Vec<u8>,
+  // pub updated_folder: Vec<u8>,
   pub folder_updates: Vec<u8>,
   pub doc_ec_bytes: Vec<u8>,
 }

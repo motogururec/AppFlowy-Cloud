@@ -1,6 +1,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_repr::{Deserialize_repr, Serialize_repr};
+use uuid::Uuid;
 
 /// Parameters used to customize the collab vector search query.
 /// In response, a list of [SearchDocumentResponseItem] is returned.
@@ -14,6 +15,53 @@ pub struct SearchDocumentRequest {
   /// Maximum length of the content string preview to return. Default: 180.
   #[serde(skip_serializing_if = "Option::is_none")]
   pub preview_size: Option<u32>,
+
+  #[serde(default = "default_search_score_limit")]
+  pub score: f64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct SearchResult {
+  pub object_id: Uuid,
+  pub content: String,
+}
+
+impl From<&SearchDocumentResponseItem> for SearchResult {
+  fn from(value: &SearchDocumentResponseItem) -> Self {
+    Self {
+      object_id: value.object_id,
+      content: value.content.clone(),
+    }
+  }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct SummarySearchResultRequest {
+  pub query: String,
+
+  pub search_results: Vec<SearchResult>,
+
+  pub only_context: bool,
+}
+
+fn default_search_score_limit() -> f64 {
+  // Higher score means better match.
+  0.2
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Summary {
+  pub content: String,
+  #[serde(default)]
+  pub highlights: String,
+  pub sources: Vec<Uuid>,
+}
+
+/// Response array element for the collab vector search query.
+/// See: [SearchDocumentRequest].
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SearchSummaryResult {
+  pub summaries: Vec<Summary>,
 }
 
 /// Response array element for the collab vector search query.
@@ -21,15 +69,19 @@ pub struct SearchDocumentRequest {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SearchDocumentResponseItem {
   /// Unique object identifier.
-  pub object_id: String,
+  pub object_id: Uuid,
   /// Workspace, result object belongs to.
-  pub workspace_id: String,
-  /// Match score of this search result to an original query.
-  /// The lower the better. List of results is sorted by this value by default.
+  pub workspace_id: Uuid,
+  /// Match score of this search result to an original query. Score represents cosine distance
+  /// between the query and the document embedding [-1.0..1.0]. The higher, the better.
+  /// List of results is sorted by this value by default.
   pub score: f64,
   /// Type of the content to be presented in preview field. This is a hint what
   /// kind of content was used to match the user query ie. document plain text, pdf attachment etc.
   pub content_type: Option<SearchContentType>,
+  /// Content of the document. This is a full content of the document, not just a preview.
+  #[serde(default)]
+  pub content: String,
   /// First N characters of the indexed content matching the user query. It doesn't have to contain
   /// the user query itself.
   pub preview: Option<String>,

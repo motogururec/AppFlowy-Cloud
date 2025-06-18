@@ -1,109 +1,61 @@
-use crate::vector::rest::check_ureq_response;
-use anyhow::anyhow;
 use app_error::AppError;
-use appflowy_ai_client::dto::{EmbeddingRequest, OpenAIEmbeddingResponse};
-use serde::de::DeserializeOwned;
-use std::time::Duration;
+use appflowy_ai_client::dto::EmbeddingModel;
+use async_openai::config::{AzureConfig, Config, OpenAIConfig};
+use async_openai::types::{CreateEmbeddingRequest, CreateEmbeddingResponse};
+use async_openai::Client;
+use text_splitter::{ChunkConfig, TextSplitter};
 use tiktoken_rs::CoreBPE;
-use unicode_segmentation::UnicodeSegmentation;
+use tracing::{trace, warn};
 
 pub const OPENAI_EMBEDDINGS_URL: &str = "https://api.openai.com/v1/embeddings";
 
 pub const REQUEST_PARALLELISM: usize = 40;
 
 #[derive(Debug, Clone)]
-pub struct Embedder {
-  bearer: String,
-  sync_client: ureq::Agent,
-  async_client: reqwest::Client,
+pub struct OpenAIEmbedder {
+  pub(crate) client: Client<OpenAIConfig>,
 }
 
-impl Embedder {
-  pub fn new(api_key: String) -> Self {
-    let bearer = format!("Bearer {api_key}");
-    let sync_client = ureq::AgentBuilder::new()
-      .max_idle_connections(REQUEST_PARALLELISM * 2)
-      .max_idle_connections_per_host(REQUEST_PARALLELISM * 2)
-      .build();
+impl OpenAIEmbedder {
+  pub fn new(config: OpenAIConfig) -> Self {
+    let client = Client::with_config(config);
 
-    let async_client = reqwest::Client::builder().build().unwrap();
-
-    Self {
-      bearer,
-      sync_client,
-      async_client,
-    }
-  }
-
-  pub fn embed(&self, params: EmbeddingRequest) -> Result<OpenAIEmbeddingResponse, AppError> {
-    for attempt in 0..3 {
-      let request = self
-        .sync_client
-        .post(OPENAI_EMBEDDINGS_URL)
-        .set("Authorization", &self.bearer)
-        .set("Content-Type", "application/json");
-
-      let result = check_ureq_response(request.send_json(&params));
-      let retry_duration = match result {
-        Ok(response) => {
-          let data = from_ureq_response::<OpenAIEmbeddingResponse>(response)?;
-          return Ok(data);
-        },
-        Err(retry) => retry.into_duration(attempt),
-      }
-      .map_err(|err| AppError::Internal(err.into()))?;
-      let retry_duration = retry_duration.min(Duration::from_secs(10));
-      std::thread::sleep(retry_duration);
-    }
-
-    Err(AppError::Internal(anyhow!(
-      "Failed to generate embeddings after 3 attempts"
-    )))
-  }
-
-  pub async fn async_embed(
-    &self,
-    params: EmbeddingRequest,
-  ) -> Result<OpenAIEmbeddingResponse, AppError> {
-    let request = self
-      .async_client
-      .post(OPENAI_EMBEDDINGS_URL)
-      .header("Authorization", &self.bearer)
-      .header("Content-Type", "application/json");
-
-    let result = request.json(&params).send().await?;
-    let response = from_response::<OpenAIEmbeddingResponse>(result).await?;
-    Ok(response)
+    Self { client }
   }
 }
 
-pub fn from_ureq_response<T>(resp: ureq::Response) -> Result<T, anyhow::Error>
-where
-  T: DeserializeOwned,
-{
-  let status_code = resp.status();
-  if status_code != 200 {
-    let body = resp.into_string()?;
-    anyhow::bail!("error code: {}, {}", status_code, body)
-  }
-
-  let resp = resp.into_json()?;
-  Ok(resp)
+#[derive(Debug, Clone)]
+pub struct AzureOpenAIEmbedder {
+  pub(crate) client: Client<AzureConfig>,
 }
 
-pub async fn from_response<T>(resp: reqwest::Response) -> Result<T, anyhow::Error>
-where
-  T: DeserializeOwned,
-{
-  let status_code = resp.status();
-  if status_code != 200 {
-    let body = resp.text().await?;
-    anyhow::bail!("error code: {}, {}", status_code, body)
+impl AzureOpenAIEmbedder {
+  pub fn new(mut config: AzureConfig) -> Self {
+    // Make sure your Azure AI service support the model
+    config = config.with_deployment_id(EmbeddingModel::default_model().to_string());
+    let client = Client::with_config(config);
+    Self { client }
   }
-
-  let resp = resp.json().await?;
-  Ok(resp)
 }
+
+pub async fn async_embed<C: Config>(
+  client: &Client<C>,
+  request: CreateEmbeddingRequest,
+) -> Result<CreateEmbeddingResponse, AppError> {
+  trace!(
+    "async embed with request: model:{:?}, dimension:{:?}, api_base:{}",
+    request.model,
+    request.dimensions,
+    client.config().api_base()
+  );
+  let response = client
+    .embeddings()
+    .create(request)
+    .await
+    .map_err(|err| AppError::Unhandled(err.to_string()))?;
+  Ok(response)
+}
+
 /// ## Execution Time Comparison Results
 ///
 /// The following results were observed when running `execution_time_comparison_tests`:
@@ -184,53 +136,71 @@ pub fn split_text_by_max_tokens(
   Ok(chunks)
 }
 
-#[inline]
-pub fn split_text_by_max_content_len(
-  content: String,
-  max_content_len: usize,
-) -> Result<Vec<String>, AppError> {
-  if content.is_empty() {
-    return Ok(vec![]);
+/// Groups a list of paragraphs into chunks that fit within a specified maximum content length.
+///
+/// takes a vector of paragraph strings and combines them into larger chunks,
+/// ensuring that each chunk's total byte length does not exceed the given `context_size`.
+/// Paragraphs are concatenated directly without additional separators. If a single paragraph
+/// exceeds the `context_size`, it is included as its own chunk without truncation.
+///
+/// # Arguments
+/// * `paragraphs` - A vector of strings, where each string represents a paragraph.
+/// * `context_size` - The maximum byte length allowed for each chunk.
+///
+/// # Returns
+/// A vector of strings, where each string is a chunk of concatenated paragraphs that fits
+/// within the `context_size`. If the input is empty, returns an empty vector.
+pub fn group_paragraphs_by_max_content_len(
+  paragraphs: Vec<String>,
+  mut context_size: usize,
+  overlap: usize,
+) -> Vec<String> {
+  if paragraphs.is_empty() {
+    return vec![];
   }
 
-  if content.len() <= max_content_len {
-    return Ok(vec![content]);
+  let mut result = Vec::new();
+  let mut current = String::with_capacity(context_size.min(4096));
+
+  if overlap > context_size {
+    warn!("context_size is smaller than overlap, which may lead to unexpected behavior.");
+    context_size = 2 * overlap;
   }
 
-  // Content is longer than max_content_len; need to split
-  let mut result = Vec::with_capacity(1 + content.len() / max_content_len);
-  let mut fragment = String::with_capacity(max_content_len);
-  let mut current_len = 0;
+  let chunk_config = ChunkConfig::new(context_size)
+    .with_overlap(overlap)
+    .unwrap();
+  let splitter = TextSplitter::new(chunk_config);
 
-  for grapheme in content.graphemes(true) {
-    let grapheme_len = grapheme.len();
-    if current_len + grapheme_len > max_content_len {
-      if !fragment.is_empty() {
-        result.push(std::mem::take(&mut fragment));
+  for paragraph in paragraphs {
+    if current.len() + paragraph.len() > context_size {
+      if !current.is_empty() {
+        result.push(std::mem::take(&mut current));
       }
-      current_len = 0;
 
-      if grapheme_len > max_content_len {
-        // Push the grapheme as a fragment on its own
-        result.push(grapheme.to_string());
-        continue;
+      if paragraph.len() > context_size {
+        let paragraph_chunks = splitter.chunks(&paragraph);
+        result.extend(paragraph_chunks.map(String::from));
+      } else {
+        current.push_str(&paragraph);
       }
+    } else {
+      // Add paragraph to current chunk
+      current.push_str(&paragraph);
     }
-    fragment.push_str(grapheme);
-    current_len += grapheme_len;
   }
 
-  // Add the last fragment if it's not empty
-  if !fragment.is_empty() {
-    result.push(fragment);
+  if !current.is_empty() {
+    result.push(current);
   }
-  Ok(result)
+
+  result
 }
 
 #[cfg(test)]
 mod tests {
 
-  use crate::vector::open_ai::{split_text_by_max_content_len, split_text_by_max_tokens};
+  use crate::vector::open_ai::{group_paragraphs_by_max_content_len, split_text_by_max_tokens};
   use tiktoken_rs::cl100k_base;
 
   #[test]
@@ -246,7 +216,7 @@ mod tests {
       assert!(content.is_char_boundary(content.len()));
     }
 
-    let params = split_text_by_max_content_len(content.clone(), max_tokens).unwrap();
+    let params = group_paragraphs_by_max_content_len(vec![content], max_tokens, 500);
     for content in params {
       assert!(content.is_char_boundary(0));
       assert!(content.is_char_boundary(content.len()));
@@ -260,7 +230,7 @@ mod tests {
     let params = split_text_by_max_tokens(content.clone(), max_tokens, &tokenizer).unwrap();
 
     let total_tokens = tokenizer.encode_ordinary(&content).len();
-    let expected_fragments = (total_tokens + max_tokens - 1) / max_tokens;
+    let expected_fragments = total_tokens.div_ceil(max_tokens);
     assert_eq!(params.len(), expected_fragments);
   }
 
@@ -283,7 +253,7 @@ mod tests {
     let params = split_text_by_max_tokens(content.clone(), max_tokens, &tokenizer).unwrap();
     assert_eq!(params.len(), 0);
 
-    let params = split_text_by_max_content_len(content.clone(), max_tokens).unwrap();
+    let params = group_paragraphs_by_max_content_len(params, max_tokens, 500);
     assert_eq!(params.len(), 0);
   }
 
@@ -295,11 +265,6 @@ mod tests {
     let params = split_text_by_max_tokens(content.clone(), max_tokens, &tokenizer).unwrap();
 
     let emojis: Vec<String> = content.chars().map(|c| c.to_string()).collect();
-    for (param, emoji) in params.iter().zip(emojis.iter()) {
-      assert_eq!(param, emoji);
-    }
-
-    let params = split_text_by_max_content_len(content.clone(), max_tokens).unwrap();
     for (param, emoji) in params.iter().zip(emojis.iter()) {
       assert_eq!(param, emoji);
     }
@@ -317,7 +282,7 @@ mod tests {
     let reconstructed_content = params.join("");
     assert_eq!(reconstructed_content, content);
 
-    let params = split_text_by_max_content_len(content.clone(), max_tokens).unwrap();
+    let params = group_paragraphs_by_max_content_len(params, max_tokens, 500);
     let reconstructed_content: String = params.concat();
     assert_eq!(reconstructed_content, content);
   }
@@ -330,7 +295,7 @@ mod tests {
     let params = split_text_by_max_tokens(content.clone(), max_tokens, &tokenizer).unwrap();
 
     let total_tokens = tokenizer.encode_ordinary(&content).len();
-    let expected_fragments = (total_tokens + max_tokens - 1) / max_tokens;
+    let expected_fragments = total_tokens.div_ceil(max_tokens);
     assert_eq!(params.len(), expected_fragments);
   }
 
@@ -342,12 +307,12 @@ mod tests {
     let params = split_text_by_max_tokens(content.clone(), max_tokens, &tokenizer).unwrap();
 
     let total_tokens = tokenizer.encode_ordinary(&content).len();
-    let expected_fragments = (total_tokens + max_tokens - 1) / max_tokens;
+    let expected_fragments = total_tokens.div_ceil(max_tokens);
     assert_eq!(params.len(), expected_fragments);
     let reconstructed_content: String = params.concat();
     assert_eq!(reconstructed_content, content);
 
-    let params = split_text_by_max_content_len(content.clone(), max_tokens).unwrap();
+    let params = group_paragraphs_by_max_content_len(params, max_tokens, 500);
     let reconstructed_content: String = params.concat();
     assert_eq!(reconstructed_content, content);
   }
@@ -360,12 +325,12 @@ mod tests {
     let params = split_text_by_max_tokens(content.clone(), max_tokens, &tokenizer).unwrap();
 
     let total_tokens = tokenizer.encode_ordinary(&content).len();
-    let expected_fragments = (total_tokens + max_tokens - 1) / max_tokens;
+    let expected_fragments = total_tokens.div_ceil(max_tokens);
     assert_eq!(params.len(), expected_fragments);
     let reconstructed_content: String = params.concat();
     assert_eq!(reconstructed_content, content);
 
-    let params = split_text_by_max_content_len(content.clone(), max_tokens).unwrap();
+    let params = group_paragraphs_by_max_content_len(params, max_tokens, 10);
     let reconstructed_content: String = params.concat();
     assert_eq!(reconstructed_content, content);
   }
@@ -379,7 +344,7 @@ mod tests {
     let reconstructed_content: String = params.concat();
     assert_eq!(reconstructed_content, content);
 
-    let params = split_text_by_max_content_len(content.clone(), max_tokens).unwrap();
+    let params = group_paragraphs_by_max_content_len(params, max_tokens, 10);
     let reconstructed_content: String = params.concat();
     assert_eq!(reconstructed_content, content);
   }
@@ -393,72 +358,144 @@ mod tests {
     let reconstructed_content: String = params.concat();
     assert_eq!(reconstructed_content, content);
 
-    let params = split_text_by_max_content_len(content.clone(), max_tokens).unwrap();
+    let params = group_paragraphs_by_max_content_len(params, max_tokens, 10);
     let reconstructed_content: String = params.concat();
     assert_eq!(reconstructed_content, content);
   }
-}
 
-// #[cfg(test)]
-// mod execution_time_comparison_tests {
-//   use crate::indexer::document_indexer::split_text_by_max_tokens;
-//   use rand::distributions::Alphanumeric;
-//   use rand::{thread_rng, Rng};
-//   use std::sync::Arc;
-//   use std::time::Instant;
-//   use tiktoken_rs::{cl100k_base, CoreBPE};
-//
-//   #[tokio::test]
-//   async fn test_execution_time_comparison() {
-//     let tokenizer = Arc::new(cl100k_base().unwrap());
-//     let max_tokens = 100;
-//
-//     let sizes = vec![500, 1000, 2000, 5000, 20000]; // Content sizes to test
-//     for size in sizes {
-//       let content = generate_random_string(size);
-//
-//       // Measure direct execution time
-//       let direct_time = measure_direct_execution(content.clone(), max_tokens, &tokenizer);
-//
-//       // Measure spawn_blocking execution time
-//       let spawn_blocking_time =
-//         measure_spawn_blocking_execution(content, max_tokens, Arc::clone(&tokenizer)).await;
-//
-//       println!(
-//         "Content Size: {} | Direct Time: {}ms | spawn_blocking Time: {}ms",
-//         size, direct_time, spawn_blocking_time
-//       );
-//     }
-//   }
-//
-//   // Measure direct execution time
-//   fn measure_direct_execution(content: String, max_tokens: usize, tokenizer: &CoreBPE) -> u128 {
-//     let start = Instant::now();
-//     split_text_by_max_tokens(content, max_tokens, tokenizer).unwrap();
-//     start.elapsed().as_millis()
-//   }
-//
-//   // Measure `spawn_blocking` execution time
-//   async fn measure_spawn_blocking_execution(
-//     content: String,
-//     max_tokens: usize,
-//     tokenizer: Arc<CoreBPE>,
-//   ) -> u128 {
-//     let start = Instant::now();
-//     tokio::task::spawn_blocking(move || {
-//       split_text_by_max_tokens(content, max_tokens, tokenizer.as_ref()).unwrap()
-//     })
-//     .await
-//     .unwrap();
-//     start.elapsed().as_millis()
-//   }
-//
-//   pub fn generate_random_string(len: usize) -> String {
-//     let rng = thread_rng();
-//     rng
-//       .sample_iter(&Alphanumeric)
-//       .take(len)
-//       .map(char::from)
-//       .collect()
-//   }
-// }
+  #[test]
+  fn test_multiple_paragraphs_single_chunk() {
+    let paragraphs = vec![
+      "First paragraph.".to_string(),
+      "Second paragraph.".to_string(),
+      "Third paragraph.".to_string(),
+    ];
+    let result = group_paragraphs_by_max_content_len(paragraphs, 100, 5);
+    assert_eq!(result.len(), 1);
+    assert_eq!(
+      result[0],
+      "First paragraph.Second paragraph.Third paragraph."
+    );
+  }
+
+  #[test]
+  fn test_large_paragraph_splitting() {
+    // Create a paragraph larger than context size
+    let large_paragraph = "A".repeat(50);
+    let paragraphs = vec![
+      "Small paragraph.".to_string(),
+      large_paragraph.clone(),
+      "Another small one.".to_string(),
+    ];
+
+    let result = group_paragraphs_by_max_content_len(paragraphs, 30, 10);
+
+    // Expected: "Small paragraph." as one chunk, then multiple chunks for the large paragraph,
+    // then "Another small one." as the final chunk
+    assert!(result.len() > 3); // At least 4 chunks (1 + at least 2 for large + 1)
+    assert_eq!(result[0], "Small paragraph.");
+    assert!(result[1].starts_with("A"));
+
+    // Check that all chunks of the large paragraph together contain the original text
+    let large_chunks = &result[1..result.len() - 1];
+    let reconstructed = large_chunks.join("");
+    // Due to overlaps, the reconstructed text might be longer
+    assert!(large_paragraph.len() <= reconstructed.len());
+    assert!(reconstructed.chars().all(|c| c == 'A'));
+  }
+
+  #[test]
+  fn test_overlap_larger_than_context_size() {
+    let paragraphs = vec![
+      "First paragraph.".to_string(),
+      "Second very long paragraph that needs to be split.".to_string(),
+    ];
+
+    // Overlap larger than context size
+    let result = group_paragraphs_by_max_content_len(paragraphs, 10, 20);
+
+    // Check that the function didn't panic and produced reasonable output
+    assert!(!result.is_empty());
+    assert_eq!(result[0], "First paragraph.");
+    assert_eq!(result[1], "Second very long paragraph that needs to");
+    assert_eq!(result[2], "that needs to be split.");
+
+    assert!(result.iter().all(|chunk| chunk.len() <= 40));
+  }
+
+  #[test]
+  fn test_exact_fit() {
+    let paragraph1 = "AAAA".to_string(); // 4 bytes
+    let paragraph2 = "BBBB".to_string(); // 4 bytes
+    let paragraph3 = "CCCC".to_string(); // 4 bytes
+
+    let paragraphs = vec![paragraph1, paragraph2, paragraph3];
+
+    // Context size exactly fits 2 paragraphs
+    let result = group_paragraphs_by_max_content_len(paragraphs, 8, 2);
+
+    assert_eq!(result.len(), 2);
+    assert_eq!(result[0], "AAAABBBB");
+    assert_eq!(result[1], "CCCC");
+  }
+  #[test]
+  fn test_edit_paragraphs() {
+    // Create initial paragraphs and convert them to Strings.
+    let mut paragraphs = vec![
+      "Rust is a multiplayer survival game developed by Facepunch Studios,",
+      "Rust is a modern, system-level programming language designed with a focus on performance, safety, and concurrency. ",
+      "Rust as a Natural Process (Oxidation) refers to the chemical reaction that occurs when metals, primarily iron, come into contact with oxygen and moisture (water) over time, leading to the formation of iron oxide, commonly known as rust. This process is a form of oxidation, where a substance reacts with oxygen in the air or water, resulting in the degradation of the metal.",
+    ]
+        .into_iter()
+        .map(|s| s.to_string())
+        .collect::<Vec<_>>();
+
+    // Confirm the original lengths of the paragraphs.
+    assert_eq!(paragraphs[0].len(), 67);
+    assert_eq!(paragraphs[1].len(), 115);
+    assert_eq!(paragraphs[2].len(), 374);
+
+    // First grouping of paragraphs with a context size of 200 and overlap 100.
+    // Expecting 4 chunks based on the original paragraphs.
+    let result = group_paragraphs_by_max_content_len(paragraphs.clone(), 200, 100);
+    assert_eq!(result.len(), 4);
+
+    // Edit paragraph 0 by appending more text, simulating a content update.
+    paragraphs.get_mut(0).unwrap().push_str(
+      " first released in early access in December 2013 and fully launched in February 2018",
+    );
+    // After edit, confirm that paragraph 0's length is updated.
+    assert_eq!(paragraphs[0].len(), 151);
+
+    // Group paragraphs again after the edit.
+    // The change should cause a shift in grouping, expecting 5 chunks now.
+    let result_2 = group_paragraphs_by_max_content_len(paragraphs.clone(), 200, 100);
+    assert_eq!(result_2.len(), 5);
+
+    // Verify that parts of the original grouping (later chunks) remain the same:
+    // The third chunk from the first run should equal the fourth from the second run.
+    assert_eq!(result[2], result_2[3]);
+    // The fourth chunk from the first run should equal the fifth from the second run.
+    assert_eq!(result[3], result_2[4]);
+
+    // Edit paragraph 1 by appending extra text, simulating another update.
+    paragraphs
+      .get_mut(1)
+      .unwrap()
+      .push_str("It was created by Mozilla.");
+
+    // Group paragraphs once again after the second edit.
+    let result_3 = group_paragraphs_by_max_content_len(paragraphs.clone(), 200, 100);
+    assert_eq!(result_3.len(), 5);
+
+    // Confirm that the grouping for the unchanged parts is still consistent:
+    // The first chunk from the previous grouping (before editing paragraph 1) stays the same.
+    assert_eq!(result_2[0], result_3[0]);
+    // Similarly, the second and third chunks (from result_2) remain unchanged.
+    assert_eq!(result_2[2], result_3[2]);
+    // The fourth chunk in both groupings should still be identical.
+    assert_eq!(result_2[3], result_3[3]);
+    // And the fifth chunk in both groupings is compared for consistency.
+    assert_eq!(result_2[4], result_3[4]);
+  }
+}

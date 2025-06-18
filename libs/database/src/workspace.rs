@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 use database_entity::dto::{
   AFRole, AFWorkspaceInvitation, AFWorkspaceInvitationStatus, AFWorkspaceSettings, GlobalComment,
-  Reaction,
+  InvitationCodeInfo, Reaction,
 };
 use futures_util::stream::BoxStream;
 use sqlx::{types::uuid, Executor, PgPool, Postgres, Transaction};
@@ -11,8 +11,8 @@ use uuid::Uuid;
 
 use crate::pg_row::{
   AFGlobalCommentRow, AFImportTask, AFPermissionRow, AFReactionRow, AFUserProfileRow,
-  AFWebUserColumn, AFWorkspaceInvitationMinimal, AFWorkspaceMemberPermRow, AFWorkspaceMemberRow,
-  AFWorkspaceRow,
+  AFWebUserWithEmailColumn, AFWorkspaceInvitationMinimal, AFWorkspaceMemberPermRow,
+  AFWorkspaceMemberRow, AFWorkspaceRow,
 };
 use crate::user::select_uid_from_email;
 use app_error::AppError;
@@ -45,14 +45,15 @@ pub async fn insert_user_workspace(
   pg_pool: &PgPool,
   user_uuid: &Uuid,
   workspace_name: &str,
+  workspace_icon: &str,
   is_initialized: bool,
 ) -> Result<AFWorkspaceRow, AppError> {
   let workspace = sqlx::query_as!(
     AFWorkspaceRow,
     r#"
     WITH new_workspace AS (
-      INSERT INTO public.af_workspace (owner_uid, workspace_name, is_initialized)
-      VALUES ((SELECT uid FROM public.af_user WHERE uuid = $1), $2, $3)
+      INSERT INTO public.af_workspace (owner_uid, workspace_name, icon, is_initialized)
+      VALUES ((SELECT uid FROM public.af_user WHERE uuid = $1), $2, $3, $4)
       RETURNING *
     )
     SELECT
@@ -71,6 +72,7 @@ pub async fn insert_user_workspace(
     "#,
     user_uuid,
     workspace_name,
+    workspace_icon,
     is_initialized,
   )
   .fetch_one(pg_pool)
@@ -518,14 +520,21 @@ pub async fn select_workspace_member_list(
   let members = sqlx::query_as!(
     AFWorkspaceMemberRow,
     r#"
-    SELECT af_user.uid, af_user.name, af_user.email,
-    af_workspace_member.role_id AS role
+    SELECT
+      af_user.uid,
+      af_user.name,
+      af_user.email,
+      af_user.metadata ->> 'icon_url' AS avatar_url,
+      af_workspace_member.role_id AS role,
+      af_workspace_member.created_at
     FROM public.af_workspace_member
         JOIN public.af_user ON af_workspace_member.uid = af_user.uid
     WHERE af_workspace_member.workspace_id = $1
+    AND role_id != $2
     ORDER BY af_workspace_member.created_at ASC;
     "#,
-    workspace_id
+    workspace_id,
+    AFRole::Guest as i32,
   )
   .fetch_all(pg_pool)
   .await?;
@@ -541,7 +550,13 @@ pub async fn select_workspace_member<'a, E: Executor<'a, Database = Postgres>>(
   let member = sqlx::query_as!(
     AFWorkspaceMemberRow,
     r#"
-    SELECT af_user.uid, af_user.name, af_user.email, af_workspace_member.role_id AS role
+    SELECT
+      af_user.uid,
+      af_user.name,
+      af_user.email,
+      af_user.metadata ->> 'icon_url' AS avatar_url,
+      af_workspace_member.role_id AS role,
+      af_workspace_member.created_at
     FROM public.af_workspace_member
       JOIN public.af_user ON af_workspace_member.uid = af_user.uid
     WHERE af_workspace_member.workspace_id = $1
@@ -564,7 +579,13 @@ pub async fn select_workspace_member_by_uuid<'a, E: Executor<'a, Database = Post
   let member = sqlx::query_as!(
     AFWorkspaceMemberRow,
     r#"
-    SELECT af_user.uid, af_user.name, af_user.email, af_workspace_member.role_id AS role
+    SELECT
+      af_user.uid,
+      af_user.name,
+      af_user.email,
+      af_user.metadata ->> 'icon_url' AS avatar_url,
+      af_workspace_member.role_id AS role,
+      af_workspace_member.created_at
     FROM public.af_workspace_member
       JOIN public.af_user ON af_workspace_member.uid = af_user.uid
     WHERE af_workspace_member.workspace_id = $1
@@ -751,6 +772,44 @@ pub async fn select_all_user_workspaces<'a, E: Executor<'a, Database = Postgres>
   Ok(workspaces)
 }
 
+/// Returns a list of workspaces that the user is part of.
+/// User must be at least member.
+#[inline]
+pub async fn select_all_user_non_guest_workspaces<'a, E: Executor<'a, Database = Postgres>>(
+  executor: E,
+  user_uuid: &Uuid,
+) -> Result<Vec<AFWorkspaceRow>, AppError> {
+  let workspaces = sqlx::query_as!(
+    AFWorkspaceRow,
+    r#"
+      SELECT
+        w.workspace_id,
+        w.database_storage_id,
+        w.owner_uid,
+        u.name AS owner_name,
+        u.email AS owner_email,
+        w.created_at,
+        w.workspace_type,
+        w.deleted_at,
+        w.workspace_name,
+        w.icon
+      FROM af_workspace w
+      JOIN af_workspace_member wm ON w.workspace_id = wm.workspace_id
+      JOIN public.af_user u ON w.owner_uid = u.uid
+      WHERE wm.uid = (
+         SELECT uid FROM public.af_user WHERE uuid = $1
+      )
+      AND wm.role_id != $2
+      AND COALESCE(w.is_initialized, true) = true;
+    "#,
+    user_uuid,
+    AFRole::Guest as i32,
+  )
+  .fetch_all(executor)
+  .await?;
+  Ok(workspaces)
+}
+
 /// Returns a list of workspace ids that the user is owner of.
 #[inline]
 pub async fn select_user_owned_workspaces_id<'a, E: Executor<'a, Database = Postgres>>(
@@ -768,6 +827,25 @@ pub async fn select_user_owned_workspaces_id<'a, E: Executor<'a, Database = Post
   .fetch_all(executor)
   .await?;
   Ok(workspace_ids)
+}
+
+pub async fn insert_workspace_ids_to_deleted_table<'a, E>(
+  executor: E,
+  workspace_ids: Vec<Uuid>,
+) -> Result<(), AppError>
+where
+  E: Executor<'a, Database = Postgres>,
+{
+  if workspace_ids.is_empty() {
+    return Ok(());
+  }
+
+  let query = "INSERT INTO public.af_workspace_deleted (workspace_id) SELECT unnest($1::uuid[])";
+  sqlx::query(query)
+    .bind(workspace_ids)
+    .execute(executor)
+    .await?;
+  Ok(())
 }
 
 pub async fn update_workspace_status<'a, E: Executor<'a, Database = Postgres>>(
@@ -1032,7 +1110,6 @@ pub async fn upsert_workspace_settings(
         DELETE FROM af_collab_embeddings e
         USING af_collab c
         WHERE e.oid = c.oid
-          AND e.partition_key = c.partition_key
           AND c.workspace_id = $1
       "#,
       workspace_id
@@ -1084,7 +1161,7 @@ pub async fn select_comments_for_published_view_ordered_by_recency<
         avc.content,
         avc.reply_comment_id,
         avc.is_deleted,
-        (au.uuid, au.name, au.metadata ->> 'icon_url') AS "user: AFWebUserColumn",
+        (au.uuid, au.name, au.email, au.metadata ->> 'icon_url') AS "user: AFWebUserWithEmailColumn",
         (NOT avc.is_deleted AND ($2 OR au.uuid = $3)) AS "can_be_deleted!"
       FROM af_published_view_comment avc
       LEFT OUTER JOIN af_user au ON avc.created_by = au.uid
@@ -1170,7 +1247,7 @@ pub async fn select_reactions_for_published_view_ordered_by_reaction_type_creati
       SELECT
         avr.comment_id,
         avr.reaction_type,
-        ARRAY_AGG((au.uuid, au.name, au.metadata ->> 'icon_url')) AS "react_users!: Vec<AFWebUserColumn>"
+        ARRAY_AGG((au.uuid, au.name, au.email, au.metadata ->> 'icon_url')) AS "react_users!: Vec<AFWebUserWithEmailColumn>"
       FROM af_published_view_reaction avr
       INNER JOIN af_user au ON avr.created_by = au.uid
       WHERE view_id = $1
@@ -1198,7 +1275,7 @@ pub async fn select_reactions_for_comment_ordered_by_reaction_type_creation_time
     r#"
       SELECT
         avr.reaction_type,
-        ARRAY_AGG((au.uuid, au.name, au.metadata ->> 'icon_url')) AS "react_users!: Vec<AFWebUserColumn>",
+        ARRAY_AGG((au.uuid, au.name, au.email, au.metadata ->> 'icon_url')) AS "react_users!: Vec<AFWebUserWithEmailColumn>",
         avr.comment_id
       FROM af_published_view_reaction avr
       INNER JOIN af_user au ON avr.created_by = au.uid
@@ -1491,4 +1568,144 @@ pub async fn select_view_id_from_publish_name(
   .await?;
 
   Ok(res)
+}
+
+pub async fn select_invited_workspace_id(
+  pg_pool: &PgPool,
+  invitation_code: &str,
+) -> Result<Uuid, AppError> {
+  let res = sqlx::query_scalar!(
+    r#"
+      SELECT workspace_id
+      FROM af_workspace_invite_code
+      WHERE invite_code = $1
+        AND (expires_at IS NULL OR expires_at > NOW())
+    "#,
+    invitation_code
+  )
+  .fetch_one(pg_pool)
+  .await?;
+
+  Ok(res)
+}
+
+pub async fn select_invitation_code_info<'a, E: Executor<'a, Database = Postgres>>(
+  executor: E,
+  invite_code: &str,
+  uid: i64,
+) -> Result<Vec<InvitationCodeInfo>, AppError> {
+  let info_list = sqlx::query_as!(
+    InvitationCodeInfo,
+    r#"
+      WITH invited_workspace_member AS (
+        SELECT
+          invite_code,
+          COUNT(*) AS member_count,
+          COUNT(CASE WHEN uid = $2 THEN uid END) > 0 AS is_member
+        FROM af_workspace_invite_code
+        JOIN af_workspace_member USING (workspace_id)
+        WHERE invite_code = $1
+        AND (expires_at IS NULL OR expires_at > NOW())
+        GROUP BY invite_code
+      )
+      SELECT
+      workspace_id,
+      owner_profile.name AS "owner_name!",
+      owner_profile.metadata ->> 'icon_url' AS owner_avatar,
+      af_workspace.workspace_name AS "workspace_name!",
+      af_workspace.icon AS workspace_icon_url,
+      invited_workspace_member.member_count AS "member_count!",
+      invited_workspace_member.is_member AS "is_member!"
+      FROM af_workspace_invite_code
+      JOIN af_workspace USING (workspace_id)
+      JOIN af_user AS owner_profile ON af_workspace.owner_uid = owner_profile.uid
+      JOIN invited_workspace_member USING (invite_code)
+      WHERE invite_code = $1
+    "#,
+    invite_code,
+    uid
+  )
+  .fetch_all(executor)
+  .await?;
+
+  Ok(info_list)
+}
+
+pub async fn upsert_workspace_member_uid<'a, E: Executor<'a, Database = Postgres>>(
+  executor: E,
+  workspace_id: &Uuid,
+  uid: i64,
+  role: AFRole,
+) -> Result<(), AppError> {
+  let role_id = role as i32;
+  sqlx::query!(
+    r#"
+      INSERT INTO af_workspace_member (workspace_id, uid, role_id)
+      VALUES ($1, $2, $3)
+      ON CONFLICT (workspace_id, uid) DO NOTHING
+    "#,
+    workspace_id,
+    uid,
+    role_id,
+  )
+  .execute(executor)
+  .await?;
+
+  Ok(())
+}
+
+pub async fn select_invite_code_for_workspace_id<'a, E: Executor<'a, Database = Postgres>>(
+  executor: E,
+  workspace_id: &Uuid,
+) -> Result<Option<String>, AppError> {
+  let code = sqlx::query_scalar!(
+    r#"
+      SELECT invite_code
+      FROM af_workspace_invite_code
+      WHERE workspace_id = $1
+    "#,
+    workspace_id,
+  )
+  .fetch_optional(executor)
+  .await?;
+
+  Ok(code)
+}
+
+pub async fn delete_all_invite_code_for_workspace<'a, E: Executor<'a, Database = Postgres>>(
+  executor: E,
+  workspace_id: &Uuid,
+) -> Result<(), AppError> {
+  sqlx::query!(
+    r#"
+      DELETE FROM af_workspace_invite_code
+      WHERE workspace_id = $1
+    "#,
+    workspace_id,
+  )
+  .execute(executor)
+  .await?;
+
+  Ok(())
+}
+
+pub async fn insert_workspace_invite_code<'a, E: Executor<'a, Database = Postgres>>(
+  executor: E,
+  workspace_id: &Uuid,
+  code: &str,
+  expires_at: Option<&chrono::DateTime<Utc>>,
+) -> Result<(), AppError> {
+  sqlx::query!(
+    r#"
+      INSERT INTO af_workspace_invite_code (workspace_id, invite_code, expires_at)
+      VALUES ($1, $2, $3)
+    "#,
+    workspace_id,
+    code,
+    expires_at.map(|dt| dt.naive_utc()),
+  )
+  .execute(executor)
+  .await?;
+
+  Ok(())
 }

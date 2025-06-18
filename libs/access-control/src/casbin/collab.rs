@@ -1,13 +1,13 @@
-use app_error::AppError;
-use async_trait::async_trait;
-use database_entity::dto::AFAccessLevel;
-use tracing::instrument;
-
 use crate::{
   act::Action,
   collab::{CollabAccessControl, RealtimeAccessControl},
   entity::ObjectType,
 };
+use app_error::AppError;
+use async_trait::async_trait;
+use database_entity::dto::AFAccessLevel;
+use tracing::instrument;
+use uuid::Uuid;
 
 use super::access::AccessControl;
 
@@ -26,9 +26,9 @@ impl CollabAccessControlImpl {
 impl CollabAccessControl for CollabAccessControlImpl {
   async fn enforce_action(
     &self,
-    workspace_id: &str,
+    workspace_id: &Uuid,
     uid: &i64,
-    _oid: &str,
+    _oid: &Uuid,
     action: Action,
   ) -> Result<(), AppError> {
     // TODO: allow non workspace member to read a collab.
@@ -42,7 +42,7 @@ impl CollabAccessControl for CollabAccessControlImpl {
 
     let result = self
       .access_control
-      .enforce(
+      .enforce_immediately(
         uid,
         ObjectType::Workspace(workspace_id.to_string()),
         workspace_action,
@@ -57,9 +57,9 @@ impl CollabAccessControl for CollabAccessControlImpl {
 
   async fn enforce_access_level(
     &self,
-    workspace_id: &str,
+    workspace_id: &Uuid,
     uid: &i64,
-    _oid: &str,
+    _oid: &Uuid,
     access_level: AFAccessLevel,
   ) -> Result<(), AppError> {
     // TODO: allow non workspace member to read a collab.
@@ -74,7 +74,7 @@ impl CollabAccessControl for CollabAccessControlImpl {
 
     let result = self
       .access_control
-      .enforce(
+      .enforce_immediately(
         uid,
         ObjectType::Workspace(workspace_id.to_string()),
         workspace_action,
@@ -91,7 +91,7 @@ impl CollabAccessControl for CollabAccessControlImpl {
   async fn update_access_level_policy(
     &self,
     _uid: &i64,
-    _oid: &str,
+    _oid: &Uuid,
     _level: AFAccessLevel,
   ) -> Result<(), AppError> {
     // TODO: allow non workspace member to read a collab.
@@ -99,7 +99,7 @@ impl CollabAccessControl for CollabAccessControlImpl {
   }
 
   #[instrument(level = "info", skip_all)]
-  async fn remove_access_level(&self, _uid: &i64, _oid: &str) -> Result<(), AppError> {
+  async fn remove_access_level(&self, _uid: &i64, _oid: &Uuid) -> Result<(), AppError> {
     // TODO: allow non workspace member to read a collab.
     Ok(())
   }
@@ -117,9 +117,9 @@ impl RealtimeCollabAccessControlImpl {
 
   async fn can_perform_action(
     &self,
-    workspace_id: &str,
+    workspace_id: &Uuid,
     uid: &i64,
-    _oid: &str,
+    _oid: &Uuid,
     required_action: Action,
   ) -> Result<bool, AppError> {
     // TODO: allow non workspace member to read a collab.
@@ -133,7 +133,7 @@ impl RealtimeCollabAccessControlImpl {
 
     self
       .access_control
-      .enforce(
+      .enforce_immediately(
         uid,
         ObjectType::Workspace(workspace_id.to_string()),
         workspace_action,
@@ -146,9 +146,9 @@ impl RealtimeCollabAccessControlImpl {
 impl RealtimeAccessControl for RealtimeCollabAccessControlImpl {
   async fn can_write_collab(
     &self,
-    workspace_id: &str,
+    workspace_id: &Uuid,
     uid: &i64,
-    oid: &str,
+    oid: &Uuid,
   ) -> Result<bool, AppError> {
     self
       .can_perform_action(workspace_id, uid, oid, Action::Write)
@@ -157,9 +157,9 @@ impl RealtimeAccessControl for RealtimeCollabAccessControlImpl {
 
   async fn can_read_collab(
     &self,
-    workspace_id: &str,
+    workspace_id: &Uuid,
     uid: &i64,
-    oid: &str,
+    oid: &Uuid,
   ) -> Result<bool, AppError> {
     self
       .can_perform_action(workspace_id, uid, oid, Action::Read)
@@ -170,20 +170,22 @@ impl RealtimeAccessControl for RealtimeCollabAccessControlImpl {
 #[cfg(test)]
 mod tests {
   use database_entity::dto::AFRole;
+  use uuid::Uuid;
 
+  use crate::casbin::util::tests::test_enforcer_v2;
   use crate::{
     act::Action,
-    casbin::{access::AccessControl, enforcer::tests::test_enforcer},
+    casbin::access::AccessControl,
     collab::CollabAccessControl,
     entity::{ObjectType, SubjectType},
   };
 
   #[tokio::test]
   pub async fn test_collab_access_control() {
-    let enforcer = test_enforcer().await;
+    let enforcer = test_enforcer_v2().await;
     let uid = 1;
-    let workspace_id = "w1";
-    let oid = "o1";
+    let workspace_id = Uuid::new_v4();
+    let oid = Uuid::new_v4();
     enforcer
       .update_policy(
         SubjectType::User(uid),
@@ -194,11 +196,11 @@ mod tests {
       .unwrap();
     let access_control = AccessControl::with_enforcer(enforcer);
     let collab_access_control = super::CollabAccessControlImpl::new(access_control);
-    for action in vec![Action::Read, Action::Write, Action::Delete] {
+    for action in [Action::Read, Action::Write, Action::Delete] {
       collab_access_control
-        .enforce_action(workspace_id, &uid, &oid, action.clone())
+        .enforce_action(&workspace_id, &uid, &oid, action.clone())
         .await
-        .expect(format!("Failed to enforce action: {:?}", action).as_str());
+        .unwrap_or_else(|_| panic!("Failed to enforce action: {:?}", action));
     }
   }
 }

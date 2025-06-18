@@ -1,14 +1,15 @@
 use std::fmt::Display;
 use std::str::FromStr;
 
-use anyhow::Context;
+use anyhow::{anyhow, Context};
+use async_openai::config::{AzureConfig, OpenAIConfig};
+use indexer::vector::embedder::get_open_ai_config;
+use infra::env_util::{get_env_var, get_env_var_opt};
+use mailer::config::MailerSetting;
 use secrecy::{ExposeSecret, Secret};
 use semver::Version;
 use serde::Deserialize;
 use sqlx::postgres::{PgConnectOptions, PgSslMode};
-
-use infra::env_util::{get_env_var, get_env_var_opt};
-use mailer::config::MailerSetting;
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -26,8 +27,9 @@ pub struct Config {
   pub published_collab: PublishedCollabSetting,
   pub mailer: MailerSetting,
   pub apple_oauth: AppleOAuthSetting,
-  pub appflowy_web_url: Option<String>,
-  pub admin_frontend_path_prefix: String,
+  pub appflowy_web_url: String,
+  pub open_ai_config: Option<OpenAIConfig>,
+  pub azure_ai_config: Option<AzureConfig>,
 }
 
 #[derive(serde::Deserialize, Clone, Debug)]
@@ -65,10 +67,8 @@ pub struct S3Setting {
 #[derive(serde::Deserialize, Clone, Debug)]
 pub struct GoTrueSetting {
   pub base_url: String,
-  pub ext_url: String, // public url
   pub jwt_secret: Secret<String>,
-  pub admin_email: String,
-  pub admin_password: Secret<String>,
+  pub service_role: String,
 }
 
 #[derive(serde::Deserialize, Clone, Debug)]
@@ -169,6 +169,7 @@ impl TryFrom<&str> for PublishedCollabStorageBackend {
 
 // Default values favor local development.
 pub fn get_configuration() -> Result<Config, anyhow::Error> {
+  let (open_ai_config, azure_ai_config) = get_open_ai_config();
   let config = Config {
     app_env: get_env_var("APPFLOWY_ENVIRONMENT", "local")
       .parse()
@@ -201,10 +202,8 @@ pub fn get_configuration() -> Result<Config, anyhow::Error> {
     },
     gotrue: GoTrueSetting {
       base_url: get_env_var("APPFLOWY_GOTRUE_BASE_URL", "http://localhost:9999"),
-      ext_url: get_env_var("APPFLOWY_GOTRUE_EXT_URL", "http://localhost:9999"),
       jwt_secret: get_env_var("APPFLOWY_GOTRUE_JWT_SECRET", "hello456").into(),
-      admin_email: get_env_var("APPFLOWY_GOTRUE_ADMIN_EMAIL", "admin@example.com"),
-      admin_password: get_env_var("APPFLOWY_GOTRUE_ADMIN_PASSWORD", "password").into(),
+      service_role: get_env_var("APPFLOWY_GOTRUE_SERVICE_ROLE", "service_role"),
     },
     application: ApplicationSetting {
       port: get_env_var("APPFLOWY_APPLICATION_PORT", "8000").parse()?,
@@ -264,8 +263,10 @@ pub fn get_configuration() -> Result<Config, anyhow::Error> {
       client_id: get_env_var("APPFLOWY_APPLE_OAUTH_CLIENT_ID", ""),
       client_secret: get_env_var("APPFLOWY_APPLE_OAUTH_CLIENT_SECRET", "").into(),
     },
-    appflowy_web_url: get_env_var_opt("APPFLOWY_WEB_URL"),
-    admin_frontend_path_prefix: get_env_var("APPFLOWY_ADMIN_FRONTEND_PATH_PREFIX", ""),
+    appflowy_web_url: get_env_var_opt("APPFLOWY_WEB_URL")
+      .ok_or(anyhow!("APPFLOWY_WEB_URL has not been set"))?,
+    open_ai_config,
+    azure_ai_config,
   };
   Ok(config)
 }

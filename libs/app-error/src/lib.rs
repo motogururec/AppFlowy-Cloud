@@ -3,13 +3,12 @@ pub mod gotrue;
 
 #[cfg(feature = "gotrue_error")]
 use crate::gotrue::GoTrueError;
-use std::error::Error;
-use std::string::FromUtf8Error;
-
 #[cfg(feature = "appflowy_ai_error")]
 use appflowy_ai_client::error::AIError;
 use reqwest::StatusCode;
 use serde::Serialize;
+use std::error::Error;
+use std::string::FromUtf8Error;
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -27,6 +26,9 @@ pub enum AppError {
 
   #[error("Record not found:{0}")]
   RecordNotFound(String),
+
+  #[error("Record deleted:{0}")]
+  RecordDeleted(String),
 
   #[error("Record already exist:{0}")]
   RecordAlreadyExists(String),
@@ -188,11 +190,32 @@ pub enum AppError {
 
   #[error("Apply update error:{0}")]
   ApplyUpdateError(String),
+
+  #[error("{0}")]
+  InvalidBlock(String),
+
+  #[error("{0}")]
+  FeatureNotAvailable(String),
+
+  #[error("unable to find invitation code")]
+  InvalidInvitationCode,
+
+  #[error("{0} is already a member of the workspace")]
+  InvalidGuest(String),
+
+  #[error("free plan workspace guest limit exceeded")]
+  FreePlanGuestLimitExceeded,
+
+  #[error("paid plan workspace guest limit exceeded")]
+  PaidPlanGuestLimitExceeded,
+
+  #[error("{0}")]
+  RetryLater(anyhow::Error),
 }
 
 impl AppError {
   pub fn is_not_enough_permissions(&self) -> bool {
-    matches!(self, AppError::NotEnoughPermissions { .. })
+    matches!(self, AppError::NotEnoughPermissions)
   }
 
   pub fn is_record_not_found(&self) -> bool {
@@ -224,7 +247,7 @@ impl AppError {
       AppError::InvalidOAuthProvider(_) => ErrorCode::InvalidOAuthProvider,
       AppError::InvalidRequest(_) => ErrorCode::InvalidRequest,
       AppError::NotLoggedIn(_) => ErrorCode::NotLoggedIn,
-      AppError::NotEnoughPermissions { .. } => ErrorCode::NotEnoughPermissions,
+      AppError::NotEnoughPermissions => ErrorCode::NotEnoughPermissions,
       AppError::StorageSpaceNotEnough => ErrorCode::StorageSpaceNotEnough,
       AppError::PayloadTooLarge(_) => ErrorCode::PayloadTooLarge,
       AppError::Internal(_) => ErrorCode::Internal,
@@ -240,7 +263,7 @@ impl AppError {
       AppError::UrlError(_) => ErrorCode::InvalidUrl,
       AppError::SerdeError(_) => ErrorCode::SerdeError,
       AppError::Connect(_) => ErrorCode::NetworkError,
-      AppError::RequestTimeout(_) => ErrorCode::NetworkError,
+      AppError::RequestTimeout(_) => ErrorCode::RequestTimeout,
       #[cfg(feature = "tokio_error")]
       AppError::TokioJoinError(_) => ErrorCode::Internal,
       #[cfg(feature = "bincode_error")]
@@ -269,6 +292,14 @@ impl AppError {
       AppError::DecodeUpdateError(_) => ErrorCode::DecodeUpdateError,
       AppError::ApplyUpdateError(_) => ErrorCode::ApplyUpdateError,
       AppError::ActionTimeout(_) => ErrorCode::ActionTimeout,
+      AppError::InvalidBlock(_) => ErrorCode::InvalidBlock,
+      AppError::FeatureNotAvailable(_) => ErrorCode::FeatureNotAvailable,
+      AppError::InvalidInvitationCode => ErrorCode::InvalidInvitationCode,
+      AppError::InvalidGuest(_) => ErrorCode::InvalidGuest,
+      AppError::FreePlanGuestLimitExceeded => ErrorCode::FreePlanGuestLimitExceeded,
+      AppError::PaidPlanGuestLimitExceeded => ErrorCode::PaidPlanGuestLimitExceeded,
+      AppError::RecordDeleted(_) => ErrorCode::RecordDeleted,
+      AppError::RetryLater(_) => ErrorCode::RetryLater,
     }
   }
 }
@@ -282,6 +313,10 @@ impl From<reqwest::Error> for AppError {
 
     if error.is_timeout() {
       return AppError::RequestTimeout(error.to_string());
+    }
+
+    if error.is_request() {
+      return AppError::ServiceTemporaryUnavailable(error.to_string());
     }
 
     if let Some(cause) = error.source() {
@@ -310,7 +345,7 @@ impl From<reqwest::Error> for AppError {
       }
     }
 
-    AppError::Unhandled(error.to_string())
+    AppError::Internal(error.into())
   }
 }
 
@@ -376,6 +411,8 @@ pub enum ErrorCode {
   Unhandled = -1,
   RecordNotFound = -2,
   RecordAlreadyExists = -3,
+  RecordDeleted = -4,
+  RetryLater = -5,
   InvalidEmail = 1001,
   InvalidPassword = 1002,
   OAuthError = 1003,
@@ -438,6 +475,14 @@ pub enum ErrorCode {
   AIMaxRequired = 1061,
   InvalidPageData = 1062,
   MemberNotFound = 1063,
+  InvalidBlock = 1064,
+  RequestTimeout = 1065,
+  AIResponseError = 1066,
+  FeatureNotAvailable = 1067,
+  InvalidInvitationCode = 1068,
+  InvalidGuest = 1069,
+  FreePlanGuestLimitExceeded = 1070,
+  PaidPlanGuestLimitExceeded = 1071,
 }
 
 impl ErrorCode {
@@ -483,5 +528,43 @@ impl From<AIError> for AppError {
       AIError::SerdeError(err) => AppError::SerdeError(err),
       AIError::ServiceUnavailable(err) => AppError::AIServiceUnavailable(err),
     }
+  }
+}
+
+#[cfg(feature = "appflowy_ai_error")]
+impl From<async_openai::error::OpenAIError> for AppError {
+  fn from(err: async_openai::error::OpenAIError) -> Self {
+    match &err {
+      async_openai::error::OpenAIError::Reqwest(e) => AppError::InvalidRequest(e.to_string()),
+      async_openai::error::OpenAIError::ApiError(e) => AppError::InvalidRequest(e.to_string()),
+      async_openai::error::OpenAIError::InvalidArgument(e) => {
+        AppError::InvalidRequest(e.to_string())
+      },
+      _ => AppError::Internal(err.into()),
+    }
+  }
+}
+
+use tokio_tungstenite::tungstenite::Error as TungsteniteError;
+
+impl From<TungsteniteError> for AppError {
+  fn from(err: TungsteniteError) -> Self {
+    match &err {
+      TungsteniteError::Http(resp) => {
+        let status = resp.status();
+        if status == StatusCode::UNAUTHORIZED.as_u16() || status == StatusCode::NOT_FOUND.as_u16() {
+          AppError::UserUnAuthorized("Unauthorized websocket connection".to_string())
+        } else {
+          AppError::Internal(err.into())
+        }
+      },
+      _ => AppError::Internal(err.into()),
+    }
+  }
+}
+
+impl From<tokio_tungstenite::tungstenite::http::header::InvalidHeaderValue> for AppError {
+  fn from(err: tokio_tungstenite::tungstenite::http::header::InvalidHeaderValue) -> Self {
+    AppError::InvalidRequest(err.to_string())
   }
 }

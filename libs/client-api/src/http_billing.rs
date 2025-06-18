@@ -1,13 +1,9 @@
-use crate::Client;
+use crate::{process_response_data, process_response_error, Client};
 use client_api_entity::billing_dto::{
   SetSubscriptionRecurringInterval, SubscriptionCancelRequest, SubscriptionLinkRequest,
   SubscriptionPlanDetail, WorkspaceUsageAndLimit,
 };
 use reqwest::Method;
-use shared_entity::dto::billing_dto::{
-  LicenseProductSubscriptionLinkQuery, LicensedProductDetail, LicensedProductType,
-  SubscribeProductLicense, UserSubscribeProduct,
-};
 use shared_entity::{
   dto::billing_dto::{RecurringInterval, SubscriptionPlan, WorkspaceSubscriptionStatus},
   response::{AppResponse, AppResponseError},
@@ -35,10 +31,7 @@ impl Client {
       .await?
       .send()
       .await?;
-
-    AppResponse::<String>::from_response(resp)
-      .await?
-      .into_data()
+    process_response_data::<String>(resp).await
   }
 
   pub async fn create_subscription(
@@ -74,9 +67,7 @@ impl Client {
       .send()
       .await?;
 
-    AppResponse::<String>::from_response(resp)
-      .await?
-      .into_data()
+    process_response_data::<String>(resp).await
   }
 
   pub async fn cancel_subscription(
@@ -93,7 +84,7 @@ impl Client {
       .json(req)
       .send()
       .await?;
-    AppResponse::<()>::from_response(resp).await?.into_error()
+    process_response_error(resp).await
   }
 
   pub async fn list_subscription(
@@ -109,9 +100,7 @@ impl Client {
       .send()
       .await?;
 
-    AppResponse::<Vec<WorkspaceSubscriptionStatus>>::from_response(resp)
-      .await?
-      .into_data()
+    process_response_data::<Vec<WorkspaceSubscriptionStatus>>(resp).await
   }
 
   pub async fn get_portal_session_link(&self) -> Result<String, AppResponseError> {
@@ -166,9 +155,7 @@ impl Client {
       .send()
       .await?;
 
-    AppResponse::<Vec<WorkspaceSubscriptionStatus>>::from_response(resp)
-      .await?
-      .into_data()
+    process_response_data::<Vec<WorkspaceSubscriptionStatus>>(resp).await
   }
 
   /// Query all active subscription, minimal information but faster
@@ -187,9 +174,7 @@ impl Client {
       .send()
       .await?;
 
-    AppResponse::<Vec<SubscriptionPlan>>::from_response(resp)
-      .await?
-      .into_data()
+    process_response_data::<Vec<SubscriptionPlan>>(resp).await
   }
 
   /// Set subscription recurring interval
@@ -208,7 +193,7 @@ impl Client {
       .send()
       .await?;
 
-    AppResponse::<()>::from_response(resp).await?.into_error()
+    process_response_error(resp).await
   }
 
   /// get all subscription plan details
@@ -222,100 +207,6 @@ impl Client {
       .send()
       .await?;
 
-    AppResponse::<Vec<SubscriptionPlanDetail>>::from_response(resp)
-      .await?
-      .into_data()
-  }
-
-  /// Return all licensed products.
-  pub async fn get_license_product_subscriptions(
-    &self,
-  ) -> Result<Vec<LicensedProductDetail>, AppResponseError> {
-    let url = format!(
-      "{}/billing/api/v1/license/products",
-      self.base_billing_url(),
-    );
-    let resp = self
-      .http_client_with_auth(Method::GET, &url)
-      .await?
-      .send()
-      .await?;
-
-    AppResponse::<Vec<LicensedProductDetail>>::from_response(resp)
-      .await?
-      .into_data()
-  }
-
-  /// Returns products that user already subscribed to
-  pub async fn get_user_license_products(&self) -> Result<UserSubscribeProduct, AppResponseError> {
-    let url = format!(
-      "{}/billing/api/v1/license/user/products",
-      self.base_billing_url(),
-    );
-    let resp = self
-      .http_client_with_auth(Method::GET, &url)
-      .await?
-      .send()
-      .await?;
-
-    AppResponse::<UserSubscribeProduct>::from_response(resp)
-      .await?
-      .into_data()
-  }
-
-  pub async fn get_license_product_detail(
-    &self,
-    product_id: &str,
-  ) -> Result<Vec<SubscribeProductLicense>, AppResponseError> {
-    let url = format!(
-      "{}/billing/api/v1/license/user/product/{}",
-      self.base_billing_url(),
-      product_id
-    );
-    let resp = self
-      .http_client_with_auth(Method::GET, &url)
-      .await?
-      .send()
-      .await?;
-
-    AppResponse::<Vec<SubscribeProductLicense>>::from_response(resp)
-      .await?
-      .into_data()
-  }
-
-  pub async fn active_license_product(&self, product_id: &str) -> Result<(), AppResponseError> {
-    let url = format!(
-      "{}/billing/api/v1/license/user/product/{}/active",
-      self.base_billing_url(),
-      product_id
-    );
-    let resp = self
-      .http_client_without_auth(Method::POST, &url)
-      .await?
-      .send()
-      .await?;
-
-    AppResponse::<()>::from_response(resp).await?.into_data()
-  }
-
-  pub async fn get_license_product_subscription_link(
-    &self,
-    product_type: LicensedProductType,
-  ) -> Result<String, AppResponseError> {
-    let query = LicenseProductSubscriptionLinkQuery { product_type };
-    let url = format!(
-      "{}/billing/api/v1/license/subscription-link",
-      self.base_billing_url(),
-    );
-    let resp = self
-      .http_client_without_auth(Method::GET, &url)
-      .await?
-      .query(&query)
-      .send()
-      .await?;
-
-    AppResponse::<String>::from_response(resp)
-      .await?
-      .into_data()
+    process_response_data::<Vec<SubscriptionPlanDetail>>(resp).await
   }
 }

@@ -11,9 +11,7 @@ use shared_entity::dto::workspace_dto::PatchWorkspaceParam;
 #[tokio::test]
 async fn workspace_list_database() {
   let (c, _user) = generate_unique_registered_user_client().await;
-  let workspace_id = c.get_workspaces().await.unwrap()[0]
-    .workspace_id
-    .to_string();
+  let workspace_id = c.get_workspaces().await.unwrap()[0].workspace_id;
 
   {
     let dbs = c.list_databases(&workspace_id).await.unwrap();
@@ -147,6 +145,7 @@ async fn add_and_delete_workspace_for_user() {
   let newly_added_workspace = c
     .create_workspace(CreateWorkspaceParam {
       workspace_name: Some("my_workspace".to_string()),
+      workspace_icon: Some("🏡".to_string()),
     })
     .await
     .unwrap();
@@ -156,17 +155,19 @@ async fn add_and_delete_workspace_for_user() {
   let _ = workspaces
     .iter()
     .find(|w| {
-      w.workspace_name == "my_workspace" && w.workspace_id == newly_added_workspace.workspace_id
+      w.workspace_name == "my_workspace"
+        && w.icon == "🏡"
+        && w.workspace_id == newly_added_workspace.workspace_id
     })
     .unwrap();
 
   // Workspace need to have at least one collab
-  let workspace_id = newly_added_workspace.workspace_id.to_string();
+  let workspace_id = newly_added_workspace.workspace_id;
   let _ = c
     .get_collab(QueryCollabParams::new(
-      &workspace_id,
+      workspace_id,
       CollabType::Folder,
-      &workspace_id,
+      workspace_id,
     ))
     .await
     .unwrap();

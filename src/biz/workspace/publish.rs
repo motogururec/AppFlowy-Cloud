@@ -42,6 +42,8 @@ use crate::{
   biz::collab::{folder_view::to_dto_folder_view_miminal, utils::get_latest_collab_folder},
 };
 
+use collab::core::collab::default_client_id;
+
 async fn check_workspace_owner_or_publisher(
   pg_pool: &PgPool,
   user_uuid: &Uuid,
@@ -204,17 +206,18 @@ pub async fn get_workspace_publish_namespace(
 pub async fn list_collab_publish_info(
   publish_collab_store: &dyn PublishedCollabStore,
   collab_storage: &CollabAccessControlStorage,
-  workspace_id: &Uuid,
+  workspace_id: Uuid,
 ) -> Result<Vec<PublishInfoView>, AppError> {
   let folder = get_latest_collab_folder(
     collab_storage,
     GetCollabOrigin::Server,
-    &workspace_id.to_string(),
+    workspace_id,
+    default_client_id(),
   )
   .await?;
 
   let publish_infos = publish_collab_store
-    .list_collab_publish_info(workspace_id)
+    .list_collab_publish_info(&workspace_id)
     .await?;
 
   let mut publish_info_views: Vec<PublishInfoView> = Vec::with_capacity(publish_infos.len());

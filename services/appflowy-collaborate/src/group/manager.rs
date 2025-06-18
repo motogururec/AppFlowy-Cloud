@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use access_control::collab::RealtimeAccessControl;
 use app_error::AppError;
-use collab::core::collab::DataSource;
+use collab::core::collab::{default_client_id, CollabOptions, DataSource};
 use collab::core::origin::CollabOrigin;
 use collab::entity::EncodedCollab;
 use collab::preclude::Collab;
@@ -14,6 +14,7 @@ use collab_stream::client::CollabRedisStream;
 use database::collab::{CollabStorage, GetCollabOrigin};
 use database_entity::dto::QueryCollabParams;
 use tracing::{instrument, trace};
+use uuid::Uuid;
 use yrs::{ReadTxn, StateVector};
 
 use crate::client::client_msg_router::ClientMessageRouter;
@@ -30,7 +31,6 @@ pub struct GroupManager<S> {
   metrics_calculate: Arc<CollabRealtimeMetrics>,
   collab_redis_stream: Arc<CollabRedisStream>,
   persistence_interval: Duration,
-  prune_grace_period: Duration,
   indexer_scheduler: Arc<IndexerScheduler>,
 }
 
@@ -45,7 +45,6 @@ where
     metrics_calculate: Arc<CollabRealtimeMetrics>,
     collab_stream: CollabRedisStream,
     persistence_interval: Duration,
-    prune_grace_period: Duration,
     indexer_scheduler: Arc<IndexerScheduler>,
   ) -> Result<Self, RealtimeError> {
     let collab_stream = Arc::new(collab_stream);
@@ -56,16 +55,15 @@ where
       metrics_calculate,
       collab_redis_stream: collab_stream,
       persistence_interval,
-      prune_grace_period,
       indexer_scheduler,
     })
   }
 
-  pub fn get_inactive_groups(&self) -> Vec<String> {
+  pub fn get_inactive_groups(&self) -> Vec<Uuid> {
     self.state.remove_inactive_groups()
   }
 
-  pub fn contains_user(&self, object_id: &str, user: &RealtimeUser) -> bool {
+  pub fn contains_user(&self, object_id: &Uuid, user: &RealtimeUser) -> bool {
     self.state.contains_user(object_id, user)
   }
 
@@ -73,27 +71,27 @@ where
     self.state.remove_user(user);
   }
 
-  pub fn contains_group(&self, object_id: &str) -> bool {
+  pub fn contains_group(&self, object_id: &Uuid) -> bool {
     self.state.contains_group(object_id)
   }
 
-  pub async fn get_group(&self, object_id: &str) -> Option<Arc<CollabGroup>> {
+  pub async fn get_group(&self, object_id: &Uuid) -> Option<Arc<CollabGroup>> {
     self.state.get_group(object_id).await
   }
 
   pub async fn subscribe_group(
     &self,
     user: &RealtimeUser,
-    object_id: &str,
+    object_id: Uuid,
     message_origin: &CollabOrigin,
     client_msg_router: &mut ClientMessageRouter,
   ) -> Result<(), RealtimeError> {
     // Lock the group and subscribe the user to the group.
-    if let Some(mut e) = self.state.get_mut_group(object_id).await {
+    if let Some(mut e) = self.state.get_mut_group(&object_id).await {
       let group = e.value_mut();
       trace!("[realtime]: {} subscribe group:{}", user, object_id,);
       let (sink, stream) = client_msg_router.init_client_communication::<CollabMessage>(
-        group.workspace_id(),
+        *group.workspace_id(),
         user,
         object_id,
         self.access_control.clone(),
@@ -114,25 +112,23 @@ where
   pub async fn create_group(
     &self,
     user: &RealtimeUser,
-    workspace_id: &str,
-    object_id: &str,
+    workspace_id: Uuid,
+    object_id: Uuid,
     collab_type: CollabType,
   ) -> Result<(), RealtimeError> {
-    let params = QueryCollabParams::new(object_id, collab_type.clone(), workspace_id);
+    let params = QueryCollabParams::new(object_id, collab_type, workspace_id);
     let res = self
       .storage
-      .get_encode_collab(GetCollabOrigin::Server, params, false)
+      .get_full_encode_collab(GetCollabOrigin::Server, params, false)
       .await;
     let state_vector = match res {
-      Ok(collab) => Collab::new_with_source(
-        CollabOrigin::Server,
-        object_id,
-        DataSource::DocStateV1(collab.doc_state.into()),
-        vec![],
-        false,
-      )?
-      .transact()
-      .state_vector(),
+      Ok(collab) => {
+        let options = CollabOptions::new(object_id.to_string(), default_client_id())
+          .with_data_source(DataSource::DocStateV1(collab.doc_state.into()));
+        Collab::new_with_options(CollabOrigin::Server, options)?
+          .transact()
+          .state_vector()
+      },
       Err(err) if err.is_record_not_found() => StateVector::default(),
       Err(err) => return Err(RealtimeError::CannotCreateGroup(err.to_string())),
     };
@@ -147,17 +143,17 @@ where
 
     let group = CollabGroup::new(
       user.uid,
-      workspace_id.to_string(),
-      object_id.to_string(),
+      workspace_id,
+      object_id,
       collab_type,
       self.metrics_calculate.clone(),
       self.storage.clone(),
       self.collab_redis_stream.clone(),
       self.persistence_interval,
-      self.prune_grace_period,
       state_vector,
       self.indexer_scheduler.clone(),
-    )?;
+    )
+    .await?;
     self.state.insert_group(object_id, group);
     Ok(())
   }
@@ -167,7 +163,7 @@ where
 #[instrument(level = "trace", skip_all)]
 async fn load_collab<S>(
   uid: i64,
-  object_id: &str,
+  object_id: &Uuid,
   params: QueryCollabParams,
   storage: Arc<S>,
 ) -> Result<(Collab, EncodedCollab), AppError>
@@ -175,15 +171,11 @@ where
   S: CollabStorage,
 {
   let encode_collab = storage
-    .get_encode_collab(GetCollabOrigin::User { uid }, params.clone(), false)
+    .get_full_encode_collab(GetCollabOrigin::User { uid }, params.clone(), false)
     .await?;
-  let result = Collab::new_with_source(
-    CollabOrigin::Server,
-    object_id,
-    DataSource::DocStateV1(encode_collab.doc_state.to_vec()),
-    vec![],
-    false,
-  );
+  let options = CollabOptions::new(object_id.to_string(), default_client_id())
+    .with_data_source(DataSource::DocStateV1(encode_collab.doc_state.to_vec()));
+  let result = Collab::new_with_options(CollabOrigin::Server, options);
   match result {
     Ok(collab) => Ok((collab, encode_collab)),
     Err(err) => load_collab_from_snapshot(object_id, params, storage)
@@ -193,7 +185,7 @@ where
 }
 
 async fn load_collab_from_snapshot<S>(
-  object_id: &str,
+  object_id: &Uuid,
   params: QueryCollabParams,
   storage: Arc<S>,
 ) -> Option<(Collab, EncodedCollab)>
@@ -207,20 +199,15 @@ where
     &params.collab_type,
   )
   .await?;
-  let collab = Collab::new_with_source(
-    CollabOrigin::Server,
-    object_id,
-    DataSource::DocStateV1(encode_collab.doc_state.to_vec()),
-    vec![],
-    false,
-  )
-  .ok()?;
+  let options = CollabOptions::new(object_id.to_string(), default_client_id())
+    .with_data_source(DataSource::DocStateV1(encode_collab.doc_state.to_vec()));
+  let collab = Collab::new_with_options(CollabOrigin::Empty, options).ok()?;
   Some((collab, encode_collab))
 }
 
 async fn get_latest_snapshot<S>(
-  workspace_id: &str,
-  object_id: &str,
+  workspace_id: &Uuid,
+  object_id: &Uuid,
   storage: &S,
   collab_type: &CollabType,
 ) -> Option<EncodedCollab>
@@ -233,18 +220,15 @@ where
     .ok()?
     .0;
   for meta in metas {
+    let object_id = Uuid::parse_str(&meta.object_id).ok()?;
     let snapshot_data = storage
-      .get_collab_snapshot(workspace_id, &meta.object_id, &meta.snapshot_id)
+      .get_collab_snapshot(*workspace_id, object_id, &meta.snapshot_id)
       .await
       .ok()?;
     if let Ok(encoded_collab) = EncodedCollab::decode_from_bytes(&snapshot_data.encoded_collab_v1) {
-      if let Ok(collab) = Collab::new_with_source(
-        CollabOrigin::Empty,
-        object_id,
-        DataSource::DocStateV1(encoded_collab.doc_state.to_vec()),
-        vec![],
-        false,
-      ) {
+      let options = CollabOptions::new(object_id.to_string(), default_client_id())
+        .with_data_source(DataSource::DocStateV1(encoded_collab.doc_state.to_vec()));
+      if let Ok(collab) = Collab::new_with_options(CollabOrigin::Empty, options) {
         // TODO(nathan): this check is not necessary, can be removed in the future.
         collab_type.validate_require_data(&collab).ok()?;
         return Some(encoded_collab);

@@ -3,21 +3,22 @@ use std::sync::Arc;
 
 pub use anyhow::Result;
 use async_trait::async_trait;
+use collab::core::collab::{default_client_id, CollabOptions};
 use collab::core::origin::CollabOrigin;
 use collab::entity::EncodedCollab;
 
+use crate::hierarchy_builder::{FlattedViews, WorkspaceViewBuilder};
 use collab::preclude::Collab;
 use collab_entity::CollabType;
 use collab_folder::{
   timestamp, Folder, FolderData, RepeatedViewIdentifier, ViewIdentifier, ViewLayout, Workspace,
 };
-
-use crate::hierarchy_builder::{FlattedViews, WorkspaceViewBuilder};
+use uuid::Uuid;
 
 pub mod database;
 pub mod document;
 
-mod hierarchy_builder;
+pub mod hierarchy_builder;
 #[cfg(test)]
 mod tests;
 
@@ -63,7 +64,7 @@ pub struct WorkspaceTemplateBuilder {
 }
 
 impl WorkspaceTemplateBuilder {
-  pub fn new(uid: i64, workspace_id: &str) -> Self {
+  pub fn new(uid: i64, workspace_id: &Uuid) -> Self {
     let handlers = WorkspaceTemplateHandlers::default();
     Self {
       uid,
@@ -146,7 +147,8 @@ impl WorkspaceTemplateBuilder {
         private: Default::default(),
       };
 
-      let collab = Collab::new_with_origin(CollabOrigin::Empty, &workspace_id, vec![], false);
+      let options = CollabOptions::new(workspace_id.clone(), default_client_id());
+      let collab = Collab::new_with_options(CollabOrigin::Empty, options)?;
       let folder = Folder::create(uid, collab, None, folder_data);
       let data = folder.encode_collab()?;
       Ok::<_, anyhow::Error>(TemplateData {
@@ -162,6 +164,6 @@ impl WorkspaceTemplateBuilder {
   }
 }
 
-pub fn gen_view_id() -> String {
-  uuid::Uuid::new_v4().to_string()
+pub fn gen_view_id() -> Uuid {
+  uuid::Uuid::new_v4()
 }

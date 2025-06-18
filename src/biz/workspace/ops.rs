@@ -1,7 +1,3 @@
-use authentication::jwt::OptionalUserUuid;
-use collab_folder::CollabOrigin;
-use collab_rt_entity::{ClientCollabMessage, UpdateSync};
-use collab_rt_protocol::{Message, SyncMessage};
 use database_entity::dto::AFWorkspaceSettingsChange;
 use std::collections::HashMap;
 
@@ -11,10 +7,9 @@ use serde_json::json;
 use sqlx::{types::uuid, PgPool};
 use std::ops::DerefMut;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use tracing::instrument;
 use uuid::Uuid;
-use yrs::updates::encoder::Encode;
 
 use access_control::workspace::WorkspaceAccessControl;
 use app_error::AppError;
@@ -28,7 +23,6 @@ use database_entity::dto::{
   AFRole, AFWorkspace, AFWorkspaceInvitation, AFWorkspaceInvitationStatus, AFWorkspaceSettings,
   GlobalComment, Reaction, WorkspaceUsage,
 };
-use gotrue::params::{GenerateLinkParams, GenerateLinkType};
 
 use shared_entity::dto::workspace_dto::{
   CreateWorkspaceMember, WorkspaceMemberChangeset, WorkspaceMemberInvitation,
@@ -36,12 +30,13 @@ use shared_entity::dto::workspace_dto::{
 use shared_entity::response::AppResponseError;
 use workspace_template::document::getting_started::GettingStartedTemplate;
 
+use crate::biz::authentication::jwt::OptionalUserUuid;
 use crate::biz::user::user_init::{
   create_user_awareness, create_workspace_collab, create_workspace_database_collab,
   initialize_workspace_for_user,
 };
 use crate::mailer::{AFCloudMailer, WorkspaceInviteMailerParam};
-use crate::state::{GoTrueAdmin, RedisConnectionManager};
+use crate::state::RedisConnectionManager;
 
 const MAX_COMMENT_LENGTH: usize = 5000;
 
@@ -58,9 +53,6 @@ pub async fn delete_workspace_for_user(
   // remove from postgres
   delete_from_workspace(&pg_pool, &workspace_id).await?;
 
-  // TODO: There can be a rare case where user uploads while workspace is being deleted.
-  // We need some routine job to clean up these orphaned files.
-
   Ok(())
 }
 
@@ -74,18 +66,19 @@ pub async fn create_empty_workspace(
   user_uid: i64,
   workspace_name: &str,
 ) -> Result<AFWorkspace, AppResponseError> {
-  let new_workspace_row = insert_user_workspace(pg_pool, user_uuid, workspace_name, false).await?;
+  let new_workspace_row =
+    insert_user_workspace(pg_pool, user_uuid, workspace_name, "", false).await?;
   workspace_access_control
     .insert_role(&user_uid, &new_workspace_row.workspace_id, AFRole::Owner)
     .await?;
-  let workspace_id = new_workspace_row.workspace_id.to_string();
+  let workspace_id = new_workspace_row.workspace_id;
 
   // create CollabType::Folder
   let mut txn = pg_pool.begin().await?;
   let start = Instant::now();
   create_workspace_collab(
     user_uid,
-    &workspace_id,
+    workspace_id,
     workspace_name,
     collab_storage,
     &mut txn,
@@ -93,12 +86,11 @@ pub async fn create_empty_workspace(
   .await?;
 
   // create CollabType::WorkspaceDatabase
-  if let Some(database_storage_id) = new_workspace_row.database_storage_id.as_ref() {
-    let workspace_database_object_id = database_storage_id.to_string();
+  if let Some(&database_storage_id) = new_workspace_row.database_storage_id.as_ref() {
     create_workspace_database_collab(
-      &workspace_id,
+      workspace_id,
       &user_uid,
-      &workspace_database_object_id,
+      database_storage_id,
       collab_storage,
       &mut txn,
       vec![],
@@ -107,14 +99,7 @@ pub async fn create_empty_workspace(
   }
 
   // create CollabType::UserAwareness
-  create_user_awareness(
-    &user_uid,
-    user_uuid,
-    &workspace_id,
-    collab_storage,
-    &mut txn,
-  )
-  .await?;
+  create_user_awareness(&user_uid, user_uuid, workspace_id, collab_storage, &mut txn).await?;
   let new_workspace = AFWorkspace::try_from(new_workspace_row)?;
   txn.commit().await?;
   collab_storage.metrics().observe_pg_tx(start.elapsed());
@@ -128,8 +113,10 @@ pub async fn create_workspace_for_user(
   user_uuid: &Uuid,
   user_uid: i64,
   workspace_name: &str,
+  workspace_icon: &str,
 ) -> Result<AFWorkspace, AppResponseError> {
-  let new_workspace_row = insert_user_workspace(pg_pool, user_uuid, workspace_name, true).await?;
+  let new_workspace_row =
+    insert_user_workspace(pg_pool, user_uuid, workspace_name, workspace_icon, true).await?;
 
   workspace_access_control
     .insert_role(&user_uid, &new_workspace_row.workspace_id, AFRole::Owner)
@@ -258,8 +245,13 @@ pub async fn get_all_user_workspaces(
   user_uuid: &Uuid,
   include_member_count: bool,
   include_role: bool,
+  exclude_guest: bool,
 ) -> Result<Vec<AFWorkspace>, AppResponseError> {
-  let workspaces = select_all_user_workspaces(pg_pool, user_uuid).await?;
+  let workspaces = if exclude_guest {
+    select_all_user_non_guest_workspaces(pg_pool, user_uuid).await?
+  } else {
+    select_all_user_workspaces(pg_pool, user_uuid).await?
+  };
   let mut workspaces = workspaces
     .into_iter()
     .flat_map(|row| {
@@ -353,21 +345,16 @@ pub async fn accept_workspace_invite(
 #[allow(clippy::too_many_arguments)]
 pub async fn invite_workspace_members(
   mailer: &AFCloudMailer,
-  gotrue_admin: &GoTrueAdmin,
   pg_pool: &PgPool,
-  gotrue_client: &gotrue::api::Client,
   inviter: &Uuid,
   workspace_id: &Uuid,
   invitations: Vec<WorkspaceMemberInvitation>,
-  appflowy_web_url: Option<&str>,
-  admin_frontend_path_prefix: &str,
+  appflowy_web_url: &str,
 ) -> Result<(), AppError> {
   let mut txn = pg_pool
     .begin()
     .await
     .context("Begin transaction to invite workspace members")?;
-  let admin_token = gotrue_admin.token().await?;
-
   let inviter_name = database::user::select_name_from_uuid(pg_pool, inviter).await?;
   let workspace_name =
     database::workspace::select_workspace_name_from_workspace_id(pg_pool, workspace_id)
@@ -430,37 +417,10 @@ pub async fn invite_workspace_members(
     };
 
     // Generate a link such that when clicked, the user is added to the workspace.
-    let accept_url = {
-      match appflowy_web_url {
-        Some(appflowy_web_url) => format!(
-          "{}/accept-invitation?invited_id={}",
-          appflowy_web_url, invite_id
-        ),
-        None => {
-          gotrue_client
-          .admin_generate_link(
-            &admin_token,
-            &GenerateLinkParams {
-              type_: GenerateLinkType::MagicLink,
-              email: invitation.email.clone(),
-              redirect_to: format!(
-                "{}/web/login-callback?action=accept_workspace_invite&workspace_invitation_id={}&workspace_name={}&workspace_icon={}&user_name={}&user_icon={}&workspace_member_count={}",
-                admin_frontend_path_prefix,
-                invite_id,
-                workspace_name,
-                workspace_icon_url,
-                inviter_name,
-                user_icon_url,
-                workspace_member_count,
-              ),
-              ..Default::default()
-            },
-          )
-          .await?
-          .action_link
-        },
-      }
-    };
+    let accept_url = format!(
+      "{}/accept-invitation?invited_id={}",
+      appflowy_web_url, invite_id
+    );
 
     if !invitation.skip_email_send {
       let cloned_mailer = mailer.clone();
@@ -579,6 +539,14 @@ pub async fn remove_workspace_members(
       workspace_access_control
         .remove_user_from_workspace(&uid, workspace_id)
         .await?;
+
+      // TODO: Add permission cache invalidation for removed user
+      // if let Some(realtime_server) = get_realtime_server_handle() {
+      //   realtime_server.send_to_workspace(
+      //     *workspace_id,
+      //     InvalidateUserPermissions { uid }
+      //   ).await;
+      // }
     }
   }
 
@@ -592,8 +560,8 @@ pub async fn remove_workspace_members(
 pub async fn get_workspace_members(
   pg_pool: &PgPool,
   workspace_id: &Uuid,
-) -> Result<Vec<AFWorkspaceMemberRow>, AppResponseError> {
-  Ok(select_workspace_member_list(pg_pool, workspace_id).await?)
+) -> Result<Vec<AFWorkspaceMemberRow>, AppError> {
+  select_workspace_member_list(pg_pool, workspace_id).await
 }
 
 pub async fn get_workspace_member(
@@ -738,56 +706,4 @@ pub async fn num_pending_task(uid: i64, pg_pool: &PgPool) -> Result<i64, AppErro
     .map_err(|e| AppError::Internal(anyhow::anyhow!("Failed to query pending tasks: {:?}", e)))?;
 
   Ok(count)
-}
-
-/// broadcast updates to collab group if exists
-pub async fn broadcast_update(
-  collab_storage: &CollabAccessControlStorage,
-  oid: &str,
-  encoded_update: Vec<u8>,
-) -> Result<(), AppError> {
-  tracing::trace!("broadcasting update to group: {}", oid);
-  let payload = Message::Sync(SyncMessage::Update(encoded_update)).encode_v1();
-  let msg = ClientCollabMessage::ClientUpdateSync {
-    data: UpdateSync {
-      origin: CollabOrigin::Server,
-      object_id: oid.to_string(),
-      msg_id: chrono::Utc::now().timestamp_millis() as u64,
-      payload: payload.into(),
-    },
-  };
-
-  collab_storage
-    .broadcast_encode_collab(oid.to_string(), vec![msg])
-    .await?;
-
-  Ok(())
-}
-
-/// like [broadcast_update] but in separate tokio task
-/// waits for a maximum of 30 seconds for the broadcast to complete
-pub async fn broadcast_update_with_timeout(
-  collab_storage: Arc<CollabAccessControlStorage>,
-  oid: String,
-  encoded_update: Vec<u8>,
-) -> tokio::task::JoinHandle<()> {
-  tokio::spawn(async move {
-    tracing::info!("broadcasting update to group: {}", oid);
-    let res = match tokio::time::timeout(
-      Duration::from_secs(30),
-      broadcast_update(&collab_storage, &oid, encoded_update),
-    )
-    .await
-    {
-      Ok(res) => res,
-      Err(err) => {
-        tracing::error!("Error while broadcasting the updates: {:?}", err);
-        return;
-      },
-    };
-    match res {
-      Ok(()) => tracing::info!("broadcasted update to group: {}", oid),
-      Err(err) => tracing::error!("Error while broadcasting the updates: {:?}", err),
-    }
-  })
 }

@@ -1,10 +1,13 @@
 use anyhow::Error;
 use client_api_test::TestClient;
-use collab_document::importer::define::{BlockType, URL_FIELD};
+use collab_document::importer::define::URL_FIELD;
 use collab_folder::ViewLayout;
 
+use collab_database::database::get_inline_view_id;
+use collab_document::blocks::BlockType;
 use std::path::PathBuf;
 use std::time::Duration;
+use uuid::Uuid;
 
 #[tokio::test]
 async fn import_blog_post_test() {
@@ -12,8 +15,8 @@ async fn import_blog_post_test() {
   let (client, imported_workspace_id) = import_notion_zip_until_complete("blog_post.zip").await;
 
   // Step 2: Fetch the folder and views
-  let folder = client.get_folder(&imported_workspace_id).await;
-  let mut space_views = folder.get_views_belong_to(&imported_workspace_id);
+  let folder = client.get_folder(imported_workspace_id).await;
+  let mut space_views = folder.get_views_belong_to(&imported_workspace_id.to_string());
   assert_eq!(
     space_views.len(),
     1,
@@ -28,7 +31,7 @@ async fn import_blog_post_test() {
   // Step 4: Fetch the imported view and document
   let imported_view = folder.get_views_belong_to(&space_view.id).pop().unwrap();
   let document = client
-    .get_document(&imported_workspace_id, &imported_view.id)
+    .get_document(imported_workspace_id, imported_view.id.parse().unwrap())
     .await;
 
   // Step 5: Generate the expected blob URLs
@@ -83,9 +86,9 @@ async fn import_blog_post_test() {
 #[tokio::test]
 async fn import_project_and_task_zip_test() {
   let (client, imported_workspace_id) = import_notion_zip_until_complete("project&task.zip").await;
-  let folder = client.get_folder(&imported_workspace_id).await;
-  let workspace_database = client.get_workspace_database(&imported_workspace_id).await;
-  let space_views = folder.get_views_belong_to(&imported_workspace_id);
+  let folder = client.get_folder(imported_workspace_id).await;
+  let workspace_database = client.get_workspace_database(imported_workspace_id).await;
+  let space_views = folder.get_views_belong_to(&imported_workspace_id.to_string());
   assert_eq!(
     space_views.len(),
     1,
@@ -118,9 +121,9 @@ async fn import_project_and_task_zip_test() {
         .database_id
         .clone();
       let database = client
-        .get_database(&imported_workspace_id, &database_id)
+        .get_database(imported_workspace_id, &database_id)
         .await;
-      let inline_views = database.get_inline_view_id();
+      let inline_views = get_inline_view_id(&database).unwrap();
       let fields = database.get_fields_in_view(&inline_views, None);
       let rows = database.collect_all_rows().await;
       assert_eq!(rows.len(), 4);
@@ -139,9 +142,9 @@ async fn import_project_and_task_zip_test() {
         .database_id
         .clone();
       let database = client
-        .get_database(&imported_workspace_id, &database_id)
+        .get_database(imported_workspace_id, &database_id)
         .await;
-      let inline_views = database.get_inline_view_id();
+      let inline_views = get_inline_view_id(&database).unwrap();
       let fields = database.get_fields_in_view(&inline_views, None);
       let rows = database.collect_all_rows().await;
       assert_eq!(rows.len(), 17);
@@ -205,7 +208,7 @@ async fn upload_file(
 }
 
 // upload_after_secs: simulate the delay of uploading the file
-async fn import_notion_zip_until_complete(name: &str) -> (TestClient, String) {
+async fn import_notion_zip_until_complete(name: &str) -> (TestClient, Uuid) {
   let client = TestClient::new_user().await;
 
   // Uncomment the following lines to use the predicated upload file API.
@@ -233,10 +236,10 @@ async fn import_notion_zip_until_complete(name: &str) -> (TestClient, String) {
 
   let imported_workspace = workspaces
     .into_iter()
-    .find(|workspace| workspace.workspace_id.to_string() != default_workspace_id)
+    .find(|workspace| workspace.workspace_id != default_workspace_id)
     .expect("Failed to find imported workspace");
 
-  let imported_workspace_id = imported_workspace.workspace_id.to_string();
+  let imported_workspace_id = imported_workspace.workspace_id;
   (client, imported_workspace_id)
 }
 

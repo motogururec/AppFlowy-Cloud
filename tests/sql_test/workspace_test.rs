@@ -1,4 +1,5 @@
-use crate::sql_test::util::{generate_random_bytes, setup_db, test_create_user};
+use crate::sql_test::util::{create_test_user, generate_random_bytes, setup_db};
+use chrono::Utc;
 
 use collab_entity::CollabType;
 use database::collab::{
@@ -15,7 +16,7 @@ async fn insert_collab_sql_test(pool: PgPool) {
   let user_uuid = uuid::Uuid::new_v4();
   let name = user_uuid.to_string();
   let email = format!("{}@appflowy.io", name);
-  let user = test_create_user(&pool, user_uuid, &email, &name)
+  let user = create_test_user(&pool, user_uuid, &email, &name)
     .await
     .unwrap();
 
@@ -29,15 +30,17 @@ async fn insert_collab_sql_test(pool: PgPool) {
     5120000, // 5 MB
   ];
   let start_time = std::time::Instant::now();
+  let updated_at = Utc::now();
   for &data_size in &data_sizes {
     let encoded_collab_v1 = generate_random_bytes(data_size);
-    let object_id = uuid::Uuid::new_v4().to_string();
-    object_ids.push(object_id.clone());
+    let object_id = uuid::Uuid::new_v4();
+    object_ids.push(object_id);
     let mut txn = pool.begin().await.unwrap();
     let params = CollabParams {
       object_id,
       collab_type: CollabType::Unknown,
       encoded_collab_v1: encoded_collab_v1.into(),
+      updated_at: Some(updated_at),
     };
     insert_into_af_collab(&mut txn, &user.uid, &user.workspace_id, &params)
       .await
@@ -53,8 +56,12 @@ async fn insert_collab_sql_test(pool: PgPool) {
       .unwrap()
       .unwrap();
 
-    assert_eq!(meta.oid, object_id);
-    assert_eq!(meta.workspace_id.to_string(), user.workspace_id);
+    assert_eq!(meta.oid, object_id.to_string());
+    assert_eq!(meta.workspace_id, user.workspace_id);
+    assert_eq!(
+      meta.updated_at.timestamp_millis(),
+      updated_at.timestamp_millis()
+    );
     assert!(meta.created_at.is_some());
     assert!(meta.deleted_at.is_none());
   }
@@ -66,7 +73,7 @@ async fn insert_bulk_collab_sql_test(pool: PgPool) {
   let user_uuid = uuid::Uuid::new_v4();
   let name = user_uuid.to_string();
   let email = format!("{}@appflowy.io", name);
-  let user = test_create_user(&pool, user_uuid, &email, &name)
+  let user = create_test_user(&pool, user_uuid, &email, &name)
     .await
     .unwrap();
 
@@ -84,13 +91,14 @@ async fn insert_bulk_collab_sql_test(pool: PgPool) {
   // Prepare bulk insert data
   for &data_size in &data_sizes {
     let encoded_collab_v1 = generate_random_bytes(data_size);
-    let object_id = uuid::Uuid::new_v4().to_string();
-    object_ids.push(object_id.clone());
+    let object_id = uuid::Uuid::new_v4();
+    object_ids.push(object_id);
 
     let params = CollabParams {
       object_id,
       collab_type: CollabType::Unknown,
       encoded_collab_v1: encoded_collab_v1.clone().into(), // Store the original data for validation
+      updated_at: None,
     };
 
     collab_params_list.push(params);
@@ -100,7 +108,7 @@ async fn insert_bulk_collab_sql_test(pool: PgPool) {
   // Perform bulk insert
   let start_time = std::time::Instant::now(); // Start timing
   let mut txn = pool.begin().await.unwrap();
-  insert_into_af_collab_bulk_for_user(&mut txn, &user.uid, &user.workspace_id, &collab_params_list)
+  insert_into_af_collab_bulk_for_user(&mut txn, &user.uid, user.workspace_id, &collab_params_list)
     .await
     .unwrap();
   txn.commit().await.unwrap();
@@ -109,7 +117,7 @@ async fn insert_bulk_collab_sql_test(pool: PgPool) {
 
   // Validate inserted data
   for (i, object_id) in object_ids.iter().enumerate() {
-    let inserted_data = select_blob_from_af_collab(&pool, &CollabType::Unknown, object_id)
+    let (_, inserted_data) = select_blob_from_af_collab(&pool, &CollabType::Unknown, object_id)
       .await
       .unwrap();
 
@@ -133,7 +141,7 @@ async fn test_bulk_insert_empty_collab_list(pool: PgPool) {
   setup_db(&pool).await.unwrap();
 
   let user_uuid = uuid::Uuid::new_v4();
-  let user = test_create_user(&pool, user_uuid, "test@appflowy.io", "test_user")
+  let user = create_test_user(&pool, user_uuid, "test@appflowy.io", "test_user")
     .await
     .unwrap();
 
@@ -142,7 +150,7 @@ async fn test_bulk_insert_empty_collab_list(pool: PgPool) {
   let result = insert_into_af_collab_bulk_for_user(
     &mut txn,
     &user.uid,
-    &user.workspace_id,
+    user.workspace_id,
     &collab_params_list,
   )
   .await;
@@ -155,35 +163,37 @@ async fn test_bulk_insert_duplicate_oid_partition_key(pool: PgPool) {
   setup_db(&pool).await.unwrap();
 
   let user_uuid = uuid::Uuid::new_v4();
-  let user = test_create_user(&pool, user_uuid, "test@appflowy.io", "test_user")
+  let user = create_test_user(&pool, user_uuid, "test@appflowy.io", "test_user")
     .await
     .unwrap();
 
-  let object_id = uuid::Uuid::new_v4().to_string();
+  let object_id = uuid::Uuid::new_v4();
   let encoded_collab_v1 = generate_random_bytes(1024); // 1KB of random data
 
   // Two items with the same oid and partition_key
   let collab_params_list = vec![
     CollabParams {
-      object_id: object_id.clone(),
+      object_id,
       collab_type: CollabType::Unknown,
       encoded_collab_v1: encoded_collab_v1.clone().into(),
+      updated_at: None,
     },
     CollabParams {
-      object_id: object_id.clone(), // Duplicate oid
+      object_id, // Duplicate oid
       collab_type: CollabType::Unknown,
       encoded_collab_v1: generate_random_bytes(2048).into(), // Different data to test update
+      updated_at: None,
     },
   ];
 
   let mut txn = pool.begin().await.unwrap();
-  insert_into_af_collab_bulk_for_user(&mut txn, &user.uid, &user.workspace_id, &collab_params_list)
+  insert_into_af_collab_bulk_for_user(&mut txn, &user.uid, user.workspace_id, &collab_params_list)
     .await
     .unwrap();
   txn.commit().await.unwrap();
 
   // Validate the data was updated, not duplicated
-  let data = select_blob_from_af_collab(&pool, &CollabType::Unknown, &object_id)
+  let (_, data) = select_blob_from_af_collab(&pool, &CollabType::Unknown, &object_id)
     .await
     .unwrap();
   assert_eq!(data, encoded_collab_v1); // should equal the data that insert first time
@@ -194,7 +204,7 @@ async fn test_batch_insert_comparison(pool: PgPool) {
   setup_db(&pool).await.unwrap();
 
   let user_uuid = uuid::Uuid::new_v4();
-  let user = test_create_user(&pool, user_uuid, "test@appflowy.io", "test_user")
+  let user = create_test_user(&pool, user_uuid, "test@appflowy.io", "test_user")
     .await
     .unwrap();
 
@@ -210,9 +220,10 @@ async fn test_batch_insert_comparison(pool: PgPool) {
       // Generate data for the total row count
       let collab_params_list: Vec<CollabParams> = (0..total_row_count)
         .map(|_| CollabParams {
-          object_id: uuid::Uuid::new_v4().to_string(),
+          object_id: uuid::Uuid::new_v4(),
           collab_type: CollabType::Unknown,
           encoded_collab_v1: generate_random_bytes(row_size).into(), // Generate random bytes for the given row size
+          updated_at: None,
         })
         .collect();
 
@@ -230,7 +241,7 @@ async fn test_batch_insert_comparison(pool: PgPool) {
       let result = insert_into_af_collab_bulk_for_user(
         &mut txn,
         &user.uid,
-        &user.workspace_id,
+        user.workspace_id,
         &collab_params_list,
       )
       .await;
@@ -252,7 +263,7 @@ async fn test_batch_insert_comparison(pool: PgPool) {
           let start_time = std::time::Instant::now();
           let mut txn = pool.begin().await.unwrap();
           let result =
-            insert_into_af_collab_bulk_for_user(&mut txn, &user.uid, &user.workspace_id, chunk)
+            insert_into_af_collab_bulk_for_user(&mut txn, &user.uid, user.workspace_id, chunk)
               .await;
 
           assert!(result.is_ok()); // Ensure the insert doesn't fail

@@ -20,10 +20,10 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::get;
 use indexer::metrics::EmbeddingMetrics;
-use indexer::thread_pool::ThreadPoolNoAbortBuilder;
+use indexer::vector::embedder::get_open_ai_config;
 use infra::env_util::get_env_var;
 use mailer::sender::Mailer;
-use secrecy::{ExposeSecret, Secret};
+use secrecy::ExposeSecret;
 use std::sync::{Arc, Once};
 use std::time::Duration;
 use tokio::net::TcpListener;
@@ -50,14 +50,10 @@ pub async fn run_server(
 pub fn init_subscriber(app_env: &Environment) {
   static START: Once = Once::new();
   START.call_once(|| {
-    let level = std::env::var("RUST_LOG").unwrap_or("info".to_string());
-    let mut filters = vec![];
-    filters.push(format!("appflowy_worker={}", level));
-    let env_filter = EnvFilter::new(filters.join(","));
+    let env_filter = EnvFilter::from_default_env();
 
     let builder = tracing_subscriber::fmt()
       .with_target(true)
-      .with_max_level(tracing::Level::TRACE)
       .with_thread_ids(false)
       .with_file(false);
 
@@ -127,29 +123,21 @@ pub async fn create_app(listener: TcpListener, config: Config) -> Result<(), Err
     maximum_import_file_size,
   ));
 
-  let threads = Arc::new(
-    ThreadPoolNoAbortBuilder::new()
-      .num_threads(30)
-      .thread_name(|index| format!("background-embedding-thread-{index}"))
-      .build()
-      .unwrap(),
-  );
+  let (open_ai_config, azure_ai_config) = get_open_ai_config();
+  let indexer_config = BackgroundIndexerConfig {
+    enable: appflowy_collaborate::config::get_env_var("APPFLOWY_INDEXER_ENABLED", "true")
+      .parse::<bool>()
+      .unwrap_or(true),
+    open_ai_config,
+    azure_ai_config,
+    tick_interval_secs: 10,
+  };
 
   tokio::spawn(run_background_indexer(
     state.pg_pool.clone(),
     state.redis_client.clone(),
     state.metrics.embedder_metrics.clone(),
-    threads.clone(),
-    BackgroundIndexerConfig {
-      enable: appflowy_collaborate::config::get_env_var("APPFLOWY_INDEXER_ENABLED", "true")
-        .parse::<bool>()
-        .unwrap_or(true),
-      open_api_key: Secret::new(appflowy_collaborate::config::get_env_var(
-        "AI_OPENAI_API_KEY",
-        "",
-      )),
-      tick_interval_secs: 10,
-    },
+    indexer_config,
   ));
 
   let app = Router::new()

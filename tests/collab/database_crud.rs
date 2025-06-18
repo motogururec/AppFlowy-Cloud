@@ -35,7 +35,7 @@ async fn database_row_upsert_with_doc() {
     assert!(row_detail.has_doc);
     assert_eq!(
       row_detail.doc,
-      Some(String::from("\nThis is a document of a database row"))
+      Some(String::from("This is a document of a database row"))
     );
   }
   // Upsert row with another doc
@@ -57,7 +57,7 @@ async fn database_row_upsert_with_doc() {
       .unwrap()[0];
     assert_eq!(
       row_detail.doc,
-      Some(String::from("\nThis is a another document"))
+      Some(String::from("This is a another document"))
     );
   }
 }
@@ -135,7 +135,7 @@ async fn database_row_upsert() {
     assert!(row_detail.has_doc);
     assert_eq!(
       row_detail.doc,
-      Some("\nThis is a document of a database row".to_string())
+      Some("This is a document of a database row".to_string())
     );
   }
 }
@@ -227,6 +227,15 @@ async fn database_fields_crud() {
       .unwrap();
     assert_eq!(row_details.len(), 1);
     let new_row_detail = &row_details[0];
+    println!(
+      "Available keys in cells: {:?}",
+      new_row_detail.cells.keys().collect::<Vec<_>>()
+    );
+    println!("Number of cells: {}", new_row_detail.cells.len());
+    for (key, value) in &new_row_detail.cells {
+      println!("Cell '{}': {:?}", key, value);
+    }
+
     assert_eq!(new_row_detail.cells["Description"], my_description);
     assert_eq!(new_row_detail.cells["Status"], my_status);
     assert_eq!(new_row_detail.cells["Multiselect"][0], "social");
@@ -327,6 +336,6 @@ async fn database_insert_row_with_doc() {
   assert!(row_detail.has_doc);
   assert_eq!(
     row_detail.doc,
-    Some("\nThis is a document of a database row".to_string())
+    Some("This is a document of a database row".to_string())
   );
 }

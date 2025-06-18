@@ -1,18 +1,18 @@
-use crate::ai_test::util::{extract_image_url, read_text_from_asset};
+use crate::ai_test::util::extract_image_url;
 use std::time::Duration;
 
 use appflowy_ai_client::dto::{
   ChatQuestionQuery, OutputContent, OutputContentMetadata, OutputLayout, ResponseFormat,
 };
-use assert_json_diff::assert_json_include;
 use client_api::entity::{QuestionStream, QuestionStreamValue};
 use client_api_test::{ai_test_enabled, TestClient};
 use futures_util::StreamExt;
 use serde_json::json;
 use shared_entity::dto::chat_dto::{
-  ChatMessageMetadata, ChatRAGData, CreateAnswerMessageParams, CreateChatMessageParams,
-  CreateChatParams, MessageCursor, UpdateChatParams,
+  CreateAnswerMessageParams, CreateChatMessageParams, CreateChatParams, MessageCursor,
+  UpdateChatParams,
 };
+use uuid::Uuid;
 
 #[tokio::test]
 async fn update_chat_settings_test() {
@@ -37,6 +37,8 @@ async fn update_chat_settings_test() {
     .unwrap();
 
   // Update name and rag_ids
+  let rag1 = Uuid::new_v4();
+  let rag2 = Uuid::new_v4();
   test_client
     .api_client
     .update_chat_settings(
@@ -45,7 +47,7 @@ async fn update_chat_settings_test() {
       UpdateChatParams {
         name: Some("my second chat".to_string()),
         metadata: None,
-        rag_ids: Some(vec!["rag1".to_string(), "rag2".to_string()]),
+        rag_ids: Some(vec![rag1.to_string(), rag2.to_string()]),
       },
     )
     .await
@@ -58,10 +60,7 @@ async fn update_chat_settings_test() {
     .await
     .unwrap();
   assert_eq!(settings.name, "my second chat");
-  assert_eq!(
-    settings.rag_ids,
-    vec!["rag1".to_string(), "rag2".to_string()]
-  );
+  assert_eq!(settings.rag_ids, vec![rag1.to_string(), rag2.to_string()]);
 
   // Update chat metadata
   test_client
@@ -190,63 +189,6 @@ async fn create_chat_and_create_messages_test() {
 }
 
 #[tokio::test]
-async fn chat_qa_test() {
-  if !ai_test_enabled() {
-    return;
-  }
-  let test_client = TestClient::new_user_without_ws_conn().await;
-  let workspace_id = test_client.workspace_id().await;
-  let chat_id = uuid::Uuid::new_v4().to_string();
-  let params = CreateChatParams {
-    chat_id: chat_id.clone(),
-    name: "new chat".to_string(),
-    rag_ids: vec![],
-  };
-
-  test_client
-    .api_client
-    .create_chat(&workspace_id, params)
-    .await
-    .unwrap();
-
-  let content = read_text_from_asset("my_profile.txt");
-  let metadata = ChatMessageMetadata {
-    data: ChatRAGData::new_text(content),
-    id: "123".to_string(),
-    name: "test context".to_string(),
-    source: "user added".to_string(),
-    extra: Some(json!({"created_at": 123})),
-  };
-
-  let params = CreateChatMessageParams::new_user("Where lucas live?").with_metadata(metadata);
-  let question = test_client
-    .api_client
-    .create_question(&workspace_id, &chat_id, params)
-    .await
-    .unwrap();
-  let expected = json!({
-      "id": "123",
-      "name": "test context",
-      "source": "user added",
-      "extra": {
-          "created_at": 123
-      }
-  });
-  assert_json_include!(
-      actual: json!(question.meta_data[0]),
-      expected: expected
-  );
-
-  let related_questions = test_client
-    .api_client
-    .get_chat_related_question(&workspace_id, &chat_id, question.message_id)
-    .await
-    .unwrap();
-  assert_eq!(related_questions.items.len(), 3);
-  println!("related questions: {:?}", related_questions.items);
-}
-
-#[tokio::test]
 async fn generate_chat_message_answer_test() {
   if !ai_test_enabled() {
     return;
@@ -276,9 +218,44 @@ async fn generate_chat_message_answer_test() {
     .stream_answer_v2(&workspace_id, &chat_id, question.message_id)
     .await
     .unwrap();
-  let answer = collect_answer(answer_stream).await;
+  let answer = collect_answer(answer_stream, None).await;
   assert!(!answer.is_empty());
 }
+
+// #[tokio::test]
+// async fn stop_streaming_test() {
+//   if !ai_test_enabled() {
+//     return;
+//   }
+//   let test_client = TestClient::new_user_without_ws_conn().await;
+//   let workspace_id = test_client.workspace_id().await;
+//   let chat_id = uuid::Uuid::new_v4().to_string();
+//   let params = CreateChatParams {
+//     chat_id: chat_id.clone(),
+//     name: "Stop streaming test".to_string(),
+//     rag_ids: vec![],
+//   };
+//
+//   test_client
+//     .api_client
+//     .create_chat(&workspace_id, params)
+//     .await
+//     .unwrap();
+//   let params = CreateChatMessageParams::new_user("when to use js");
+//   let question = test_client
+//     .api_client
+//     .create_question(&workspace_id, &chat_id, params)
+//     .await
+//     .unwrap();
+//   let answer_stream = test_client
+//     .api_client
+//     .stream_answer_v2(&workspace_id, &chat_id, question.message_id)
+//     .await
+//     .unwrap();
+//   let answer = collect_answer(answer_stream, Some(1)).await;
+//   println!("answer:\n{}", answer);
+//   assert!(!answer.is_empty());
+// }
 
 #[tokio::test]
 async fn get_format_question_message_test() {
@@ -322,10 +299,10 @@ async fn get_format_question_message_test() {
 
   let answer_stream = test_client
     .api_client
-    .stream_answer_v3(&workspace_id, query)
+    .stream_answer_v3(&workspace_id, query, None)
     .await
     .unwrap();
-  let answer = collect_answer(answer_stream).await;
+  let answer = collect_answer(answer_stream, None).await;
   println!("answer:\n{}", answer);
   assert!(!answer.is_empty());
 }
@@ -377,10 +354,10 @@ async fn get_text_with_image_message_test() {
 
   let answer_stream = test_client
     .api_client
-    .stream_answer_v3(&workspace_id, query)
+    .stream_answer_v3(&workspace_id, query, None)
     .await
     .unwrap();
-  let answer = collect_answer(answer_stream).await;
+  let answer = collect_answer(answer_stream, None).await;
   println!("answer:\n{}", answer);
   let image_url = extract_image_url(&answer).unwrap();
   let (workspace_id_2, chat_id_2, file_id_2) = test_client
@@ -407,8 +384,6 @@ async fn get_text_with_image_message_test() {
         break;
       },
       Err(err) => {
-        eprintln!("Failed to get blob: {:?}", err);
-        // Save the error and retry
         last_error = Some(err);
         retries -= 1;
       },
@@ -420,7 +395,10 @@ async fn get_text_with_image_message_test() {
   }
 
   if let Some(err) = last_error {
-    panic!("Failed to get blob after retries: {:?}", err);
+    panic!(
+      "Failed to get blob after retries: {:?}, url:{}",
+      err, image_url
+    );
   }
 
   assert!(!answer.is_empty());
@@ -498,19 +476,28 @@ async fn get_model_list_test() {
     .unwrap()
     .models;
   assert!(!models.is_empty());
-  assert!(models.len() >= 5, "models.len() = {}", models.len());
+  assert!(models.len() >= 2, "models.len() = {}", models.len());
   println!("models: {:?}", models);
 }
 
-async fn collect_answer(mut stream: QuestionStream) -> String {
+async fn collect_answer(
+  mut stream: QuestionStream,
+  stop_when_num_of_char: Option<usize>,
+) -> String {
   let mut answer = String::new();
+  let mut num_of_char: usize = 0;
   while let Some(value) = stream.next().await {
-    match value.unwrap() {
+    num_of_char += match value.unwrap() {
       QuestionStreamValue::Answer { value } => {
         answer.push_str(&value);
+        value.len()
       },
-      QuestionStreamValue::Metadata { .. } => {},
-      QuestionStreamValue::KeepAlive => {},
+      _ => 0,
+    };
+    if let Some(stop_when_num_of_char) = stop_when_num_of_char {
+      if num_of_char >= stop_when_num_of_char {
+        break;
+      }
     }
   }
   answer

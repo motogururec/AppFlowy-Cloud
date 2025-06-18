@@ -3,10 +3,14 @@ use serde_json::json;
 use serde_repr::{Deserialize_repr, Serialize_repr};
 use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
+use uuid::Uuid;
+
 pub const STREAM_METADATA_KEY: &str = "0";
 pub const STREAM_ANSWER_KEY: &str = "1";
 pub const STREAM_IMAGE_KEY: &str = "2";
 pub const STREAM_KEEP_ALIVE_KEY: &str = "3";
+pub const STREAM_COMMENT_KEY: &str = "4";
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SummarizeRowResponse {
   pub text: String,
@@ -41,7 +45,13 @@ pub struct ResponseFormat {
   pub output_content_metadata: Option<OutputContentMetadata>,
 }
 
-#[derive(Clone, Debug, Default, Serialize_repr, Deserialize_repr)]
+impl ResponseFormat {
+  pub fn new() -> Self {
+    Self::default()
+  }
+}
+
+#[derive(Clone, Debug, Default, Serialize_repr, Deserialize_repr, Eq, PartialEq)]
 #[repr(u8)]
 pub enum OutputLayout {
   Paragraph = 0,
@@ -140,7 +150,7 @@ pub struct CompleteTextResponse {
   pub text: String,
 }
 
-#[derive(Clone, Debug, Serialize_repr, Deserialize_repr)]
+#[derive(Clone, Debug, Serialize_repr, Deserialize_repr, Eq, PartialEq, Hash)]
 #[repr(u8)]
 pub enum CompletionType {
   ImproveWriting = 1,
@@ -149,6 +159,8 @@ pub enum CompletionType {
   MakeLonger = 4,
   ContinueWriting = 5,
   Explain = 6,
+  AskAI = 7,
+  CustomPrompt = 8,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -214,70 +226,7 @@ pub struct TranslateRowResponse {
   pub items: Vec<HashMap<String, String>>,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
-#[serde(untagged)]
-pub enum EmbeddingInput {
-  /// The string that will be turned into an embedding.
-  String(String),
-  /// The array of strings that will be turned into an embedding.
-  StringArray(Vec<String>),
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
-#[serde(untagged)]
-pub enum EmbeddingOutput {
-  Float(Vec<f64>),
-  Base64(String),
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-pub struct Embedding {
-  /// An integer representing the index of the embedding in the list of embeddings.
-  pub index: i32,
-  /// The embedding value, which is an instance of `EmbeddingOutput`.
-  pub embedding: EmbeddingOutput,
-}
-
-/// https://platform.openai.com/docs/api-reference/embeddings
-#[derive(Serialize, Deserialize, Debug)]
-pub struct OpenAIEmbeddingResponse {
-  /// A string that is always set to "embedding".
-  pub object: String,
-  /// A list of `Embedding` objects.
-  pub data: Vec<Embedding>,
-  /// A string representing the model used to generate the embeddings.
-  pub model: String,
-  /// An integer representing the total number of tokens used.
-  pub usage: EmbeddingUsage,
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-pub struct EmbeddingUsage {
-  #[serde(default)]
-  pub prompt_tokens: i32,
-  pub total_tokens: i32,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-#[serde(rename_all = "lowercase")]
-pub enum EmbeddingEncodingFormat {
-  Float,
-  Base64,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct EmbeddingRequest {
-  /// An instance of `EmbeddingInput` containing the data to be embedded.
-  pub input: EmbeddingInput,
-  /// A string representing the model to use for generating embeddings.
-  pub model: String,
-  /// An instance of `EmbeddingEncodingFormat` representing the format of the embedding.
-  pub encoding_format: EmbeddingEncodingFormat,
-  /// An integer representing the number of dimensions for the embedding.
-  pub dimensions: i32,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Serialize, Deserialize, Debug, Copy, Clone, PartialEq, Eq, Hash)]
 pub enum EmbeddingModel {
   #[serde(rename = "text-embedding-3-small")]
   TextEmbedding3Small,
@@ -288,6 +237,15 @@ pub enum EmbeddingModel {
 }
 
 impl EmbeddingModel {
+  /// Returns the default embedding model used in this system.
+  ///
+  /// This model is hardcoded and used to generate embeddings whose dimensions are
+  /// reflected in the PostgreSQL database schema. Changing the default model may
+  /// require a migration to create a new table with the appropriate dimensions.
+  pub fn default_model() -> Self {
+    EmbeddingModel::TextEmbedding3Small
+  }
+
   pub fn supported_models() -> &'static [&'static str] {
     &[
       "text-embedding-ada-002",
@@ -304,7 +262,7 @@ impl EmbeddingModel {
     }
   }
 
-  pub fn default_dimensions(&self) -> i32 {
+  pub fn default_dimensions(&self) -> u32 {
     match self {
       EmbeddingModel::TextEmbeddingAda002 => 1536,
       EmbeddingModel::TextEmbedding3Large => 3072,
@@ -431,12 +389,11 @@ impl Display for CreateChatContext {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct CustomPrompt {
   pub system: String,
-  pub user: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CalculateSimilarityParams {
-  pub workspace_id: String,
+  pub workspace_id: Uuid,
   pub input: String,
   pub expected: String,
   pub use_embedding: bool,
@@ -448,25 +405,41 @@ pub struct SimilarityResponse {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CompletionMessage {
+  pub role: String, // human, ai, or system
+  pub content: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CompletionMetadata {
-  /// A unique identifier for the object.
-  pub object_id: String,
+  /// A unique identifier for the object. Object could be a document id.
+  pub object_id: Uuid,
   /// The workspace identifier.
   ///
-  /// This field must be provided when generating images.
-  pub workspace_id: Option<String>,
+  /// This field must be provided when generating images. We use workspace ID to track image usage.
+  pub workspace_id: Option<Uuid>,
   /// A list of relevant document IDs.
   ///
   /// When using completions for document-related tasks, this should include the document ID.
   /// In some cases, `object_id` may be the same as the document ID.
   pub rag_ids: Option<Vec<String>>,
+  /// For the AI completion feature (the AI writer), pass the conversation history as input.
+  /// This history helps the AI understand the context of the conversation.
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub completion_history: Option<Vec<CompletionMessage>>,
+  /// When completion type is 'CustomPrompt', this field should be provided.
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub custom_prompt: Option<CustomPrompt>,
+  /// The id of the prompt used for the completion
+  #[serde(default)]
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub prompt_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CompleteTextParams {
   pub text: String,
   pub completion_type: Option<CompletionType>,
-  pub custom_prompt: Option<CustomPrompt>,
   #[serde(default)]
   #[serde(skip_serializing_if = "Option::is_none")]
   pub metadata: Option<CompletionMetadata>,
@@ -483,7 +456,6 @@ impl CompleteTextParams {
     Self {
       text,
       completion_type: Some(completion_type),
-      custom_prompt: None,
       metadata,
       format: Default::default(),
     }

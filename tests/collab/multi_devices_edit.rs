@@ -1,24 +1,20 @@
-use std::time::Duration;
-
 use client_api::entity::AFRole;
+use client_api_test::*;
 use collab_entity::CollabType;
+use database_entity::dto::QueryCollabParams;
 use serde_json::json;
 use sqlx::types::uuid;
-use tokio::time::sleep;
 use tracing::trace;
-
-use client_api_test::*;
-use database_entity::dto::QueryCollabParams;
 
 #[tokio::test]
 async fn sync_collab_content_after_reconnect_test() {
-  let object_id = uuid::Uuid::new_v4().to_string();
+  let object_id = uuid::Uuid::new_v4();
   let collab_type = CollabType::Unknown;
 
   let mut test_client = TestClient::new_user().await;
   let workspace_id = test_client.workspace_id().await;
   test_client
-    .open_collab(&workspace_id, &object_id, collab_type.clone())
+    .open_collab(workspace_id, object_id, collab_type)
     .await;
 
   // Disconnect the client and edit the collab. The updates will not be sent to the server.
@@ -32,11 +28,7 @@ async fn sync_collab_content_after_reconnect_test() {
   // it will return RecordNotFound error when trying to get the collab from the server
   let err = test_client
     .api_client
-    .get_collab(QueryCollabParams::new(
-      &object_id,
-      collab_type.clone(),
-      &workspace_id,
-    ))
+    .get_collab(QueryCollabParams::new(object_id, collab_type, workspace_id))
     .await
     .unwrap_err();
   assert!(err.is_record_not_found());
@@ -50,9 +42,9 @@ async fn sync_collab_content_after_reconnect_test() {
     .unwrap();
 
   assert_server_collab(
-    &workspace_id,
+    workspace_id,
     &mut test_client.api_client,
-    &object_id,
+    object_id,
     &collab_type,
     10,
     json!( {
@@ -69,6 +61,61 @@ async fn sync_collab_content_after_reconnect_test() {
 }
 
 #[tokio::test]
+async fn same_client_connect_then_edit_multiple_time_test() {
+  let collab_type = CollabType::Unknown;
+  let registered_user = generate_unique_registered_user().await;
+  let mut client_1 = TestClient::user_with_new_device(registered_user.clone()).await;
+
+  let workspace_id = client_1.workspace_id().await;
+  let object_id = client_1
+    .create_and_edit_collab(workspace_id, collab_type)
+    .await;
+
+  // client 1 edit the collab
+  client_1.insert_into(&object_id, "1", "a").await;
+  client_1
+    .wait_object_sync_complete(&object_id)
+    .await
+    .unwrap();
+  client_1.disconnect().await;
+
+  client_1.insert_into(&object_id, "2", "b").await;
+  client_1.reconnect().await;
+  client_1
+    .wait_object_sync_complete(&object_id)
+    .await
+    .unwrap();
+
+  for _ in 0..5 {
+    client_1.reconnect().await;
+    client_1
+      .wait_object_sync_complete(&object_id)
+      .await
+      .unwrap();
+    client_1.disconnect().await;
+  }
+
+  let expected_json = json!({
+    "1": "a",
+    "2": "b"
+  });
+  assert_server_collab(
+    workspace_id,
+    &mut client_1.api_client,
+    object_id,
+    &collab_type,
+    30,
+    expected_json.clone(),
+  )
+  .await
+  .unwrap();
+
+  assert_client_collab_value(&mut client_1, &object_id, expected_json)
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
 async fn same_client_with_diff_devices_edit_same_collab_test() {
   let collab_type = CollabType::Unknown;
   let registered_user = generate_unique_registered_user().await;
@@ -77,7 +124,7 @@ async fn same_client_with_diff_devices_edit_same_collab_test() {
 
   let workspace_id = client_1.workspace_id().await;
   let object_id = client_1
-    .create_and_edit_collab(&workspace_id, collab_type.clone())
+    .create_and_edit_collab(workspace_id, collab_type)
     .await;
 
   // client 1 edit the collab
@@ -88,9 +135,9 @@ async fn same_client_with_diff_devices_edit_same_collab_test() {
     .unwrap();
 
   assert_server_collab(
-    &workspace_id,
+    workspace_id,
     &mut client_1.api_client,
-    &object_id,
+    object_id,
     &collab_type,
     30,
     json!({
@@ -101,7 +148,7 @@ async fn same_client_with_diff_devices_edit_same_collab_test() {
   .unwrap();
 
   client_2
-    .open_collab(&workspace_id, &object_id, collab_type.clone())
+    .open_collab(workspace_id, object_id, collab_type)
     .await;
   client_2
     .wait_object_sync_complete(&object_id)
@@ -109,8 +156,6 @@ async fn same_client_with_diff_devices_edit_same_collab_test() {
     .unwrap();
   trace!("client 2 disconnect: {:?}", client_2.device_id);
   client_2.disconnect().await;
-  sleep(Duration::from_millis(2000)).await;
-
   client_2.insert_into(&object_id, "name", "workspace2").await;
   client_2.reconnect().await;
   client_2
@@ -124,6 +169,7 @@ async fn same_client_with_diff_devices_edit_same_collab_test() {
 
   assert_client_collab_within_secs(&mut client_2, &object_id, "name", expected_json.clone(), 60)
     .await;
+
   assert_client_collab_within_secs(&mut client_1, &object_id, "name", expected_json.clone(), 60)
     .await;
 }
@@ -139,10 +185,10 @@ async fn same_client_with_diff_devices_edit_diff_collab_test() {
 
   // different devices create different collabs. the collab will be synced between devices
   let object_id_1 = device_1
-    .create_and_edit_collab(&workspace_id, collab_type.clone())
+    .create_and_edit_collab(workspace_id, collab_type)
     .await;
   let object_id_2 = device_2
-    .create_and_edit_collab(&workspace_id, collab_type.clone())
+    .create_and_edit_collab(workspace_id, collab_type)
     .await;
 
   // client 1 edit the collab with object_id_1
@@ -161,7 +207,7 @@ async fn same_client_with_diff_devices_edit_diff_collab_test() {
 
   // client1 open the collab with object_id_2
   device_1
-    .open_collab(&workspace_id, &object_id_2, collab_type.clone())
+    .open_collab(workspace_id, object_id_2, collab_type)
     .await;
   assert_client_collab_within_secs(
     &mut device_1,
@@ -176,7 +222,7 @@ async fn same_client_with_diff_devices_edit_diff_collab_test() {
 
   // client2 open the collab with object_id_1
   device_2
-    .open_collab(&workspace_id, &object_id_1, collab_type.clone())
+    .open_collab(workspace_id, object_id_1, collab_type)
     .await;
   assert_client_collab_within_secs(
     &mut device_2,
@@ -198,7 +244,7 @@ async fn edit_document_with_both_clients_offline_then_online_sync_test() {
 
   let workspace_id = client_1.workspace_id().await;
   let object_id = client_1
-    .create_and_edit_collab(&workspace_id, collab_type.clone())
+    .create_and_edit_collab(workspace_id, collab_type)
     .await;
 
   // add client 2 as a member of the workspace
@@ -209,7 +255,7 @@ async fn edit_document_with_both_clients_offline_then_online_sync_test() {
   client_1.disconnect().await;
 
   client_2
-    .open_collab(&workspace_id, &object_id, collab_type.clone())
+    .open_collab(workspace_id, object_id, collab_type)
     .await;
   client_2.disconnect().await;
 
@@ -251,4 +297,61 @@ async fn edit_document_with_both_clients_offline_then_online_sync_test() {
   assert_client_collab_include_value(&mut client_2, &object_id, expected_json.clone())
     .await
     .unwrap();
+}
+
+#[cfg(feature = "sync-v2")]
+#[tokio::test]
+async fn sync_new_documents_created_when_offline_test() {
+  use tokio::time::*;
+  const TIMEOUT: Duration = Duration::from_secs(5);
+  let collab_type = CollabType::Unknown;
+  let mut client_1 = TestClient::new_user().await;
+  let mut client_2 = TestClient::new_user().await;
+
+  let workspace_id = client_1.workspace_id().await;
+
+  // add client 2 as a member of the workspace
+  client_1
+    .invite_and_accepted_workspace_member(&workspace_id, &client_2, AFRole::Member)
+    .await
+    .unwrap();
+  timeout(TIMEOUT, client_1.disconnect())
+    .await
+    .expect("first disconnect");
+  sleep(Duration::from_secs(1)).await;
+
+  // on client 2: create some new collabs while client 1 is offline
+  let mut object_ids = Vec::new();
+  for _ in 0..5 {
+    let object_id = client_2
+      .create_and_edit_collab(workspace_id, collab_type)
+      .await;
+    client_2.insert_into(&object_id, "key", "value").await;
+    client_2
+      .wait_object_sync_complete(&object_id)
+      .await
+      .unwrap();
+    object_ids.push(object_id);
+  }
+
+  // connect client 1 again and wait a while for sync to complete without asking collabs explicitly
+  timeout(TIMEOUT, client_1.reconnect())
+    .await
+    .expect("reconnect");
+  sleep(Duration::from_secs(5)).await;
+
+  // disconnect client 1 again and check if collabs from client 2 were synced
+  timeout(TIMEOUT, client_1.disconnect())
+    .await
+    .expect("second disconnect");
+  let expected = json!({"key":"value"});
+  for object_id in object_ids {
+    client_1
+      .open_collab(workspace_id, object_id, collab_type)
+      .await;
+
+    assert_client_collab_include_value(&mut client_1, &object_id, expected.clone())
+      .await
+      .unwrap();
+  }
 }

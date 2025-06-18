@@ -12,13 +12,13 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 struct TestDoc {
-  object_id: String,
+  object_id: Uuid,
   editor: TestDocumentEditor,
 }
 
 impl TestDoc {
   fn new(contents: Vec<&'static str>) -> Self {
-    let object_id = Uuid::new_v4().to_string();
+    let object_id = Uuid::new_v4();
     let mut editor = empty_document_editor(&object_id);
     editor.insert_paragraphs(contents.into_iter().map(|s| s.to_string()).collect());
 
@@ -45,8 +45,8 @@ async fn chat_with_multiple_selected_source_test() {
     .iter()
     .map(|doc| {
       let params = CreateCollabParams {
-        workspace_id: workspace_id.clone(),
-        object_id: doc.object_id.clone(),
+        workspace_id,
+        object_id: doc.object_id,
         encoded_collab_v1: doc.editor.encode_collab().encode_to_bytes().unwrap(),
         collab_type: CollabType::Document,
       };
@@ -68,15 +68,16 @@ async fn chat_with_multiple_selected_source_test() {
     .iter()
     .map(|doc| EmbeddedCollabQuery {
       collab_type: CollabType::Document,
-      object_id: doc.object_id.clone(),
+      object_id: doc.object_id,
     })
     .collect();
   test_client
     .wait_until_all_embedding(&workspace_id, query)
-    .await;
+    .await
+    .unwrap();
 
   // create chat
-  let chat_id = uuid::Uuid::new_v4().to_string();
+  let chat_id = Uuid::new_v4().to_string();
   let params = CreateChatParams {
     chat_id: chat_id.clone(),
     name: "my first chat".to_string(),
@@ -92,7 +93,7 @@ async fn chat_with_multiple_selected_source_test() {
   let params = UpdateChatParams {
     name: None,
     metadata: None,
-    rag_ids: Some(vec![docs[0].object_id.clone()]),
+    rag_ids: Some(vec![docs[0].object_id.to_string()]),
   };
   test_client
     .api_client
@@ -124,7 +125,10 @@ async fn chat_with_multiple_selected_source_test() {
   let params = UpdateChatParams {
     name: None,
     metadata: None,
-    rag_ids: Some(vec![docs[0].object_id.clone(), docs[1].object_id.clone()]),
+    rag_ids: Some(vec![
+      docs[0].object_id.to_string(),
+      docs[1].object_id.to_string(),
+    ]),
   };
   test_client
     .api_client
@@ -193,7 +197,7 @@ async fn chat_with_selected_source_override_test() {
   if !ai_test_enabled() {
     return;
   }
-  let object_id = Uuid::new_v4().to_string();
+  let object_id = Uuid::new_v4();
   let mut editor = empty_document_editor(&object_id);
   let contents = alex_software_engineer_story();
   editor.insert_paragraphs(contents.into_iter().map(|s| s.to_string()).collect());
@@ -202,22 +206,23 @@ async fn chat_with_selected_source_override_test() {
   let test_client = TestClient::new_user().await;
   let workspace_id = test_client.workspace_id().await;
   let params = CreateCollabParams {
-    workspace_id: workspace_id.clone(),
-    object_id: object_id.clone(),
+    workspace_id,
+    object_id,
     encoded_collab_v1: encode_collab.encode_to_bytes().unwrap(),
     collab_type: CollabType::Document,
   };
   test_client.api_client.create_collab(params).await.unwrap();
   test_client
     .wait_until_get_embedding(&workspace_id, &object_id)
-    .await;
+    .await
+    .unwrap();
 
   // chat with document
   let chat_id = uuid::Uuid::new_v4().to_string();
   let params = CreateChatParams {
     chat_id: chat_id.clone(),
     name: "my first chat".to_string(),
-    rag_ids: vec![object_id.clone()],
+    rag_ids: vec![object_id],
   };
 
   // create a chat
@@ -254,7 +259,7 @@ Overall, Alex balances his work as a software programmer with his passion for sp
   // Simulate insert new content
   let contents = alex_banker_story();
   editor.insert_paragraphs(contents.into_iter().map(|s| s.to_string()).collect());
-  let text = editor.document.to_plain_text(false, false).unwrap();
+  let text = editor.document.paragraphs().join("");
   let expected = alex_banker_story().join("");
   assert_eq!(text, expected);
 
@@ -294,7 +299,7 @@ Overall, Alex balances his work as a software programmer with his passion for sp
 
 async fn ask_question(
   test_client: &TestClient,
-  workspace_id: &str,
+  workspace_id: &Uuid,
   chat_id: &str,
   question: &str,
 ) -> String {

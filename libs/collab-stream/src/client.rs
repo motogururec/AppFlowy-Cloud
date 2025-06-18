@@ -1,22 +1,25 @@
-use crate::collab_update_sink::{AwarenessUpdateSink, CollabUpdateSink};
-use crate::error::{internal, StreamError};
+use crate::awareness_gossip::{AwarenessGossip, AwarenessUpdateSink};
+use crate::collab_update_sink::CollabUpdateSink;
+use crate::error::StreamError;
 use crate::lease::{Lease, LeaseAcquisition};
 use crate::metrics::CollabStreamMetrics;
-use crate::model::{AwarenessStreamUpdate, CollabStreamUpdate, MessageId};
-use crate::stream_group::{StreamConfig, StreamGroup};
-use crate::stream_router::{StreamRouter, StreamRouterOptions};
-use futures::Stream;
+use crate::model::{AwarenessStreamUpdate, CollabStreamUpdate, MessageId, UpdateStreamMessage};
+use crate::stream_router::{FromRedisStream, StreamRouter, StreamRouterOptions};
+use collab_entity::CollabType;
+use futures::{Stream, StreamExt};
 use redis::aio::ConnectionManager;
 use redis::streams::StreamReadReply;
 use redis::{AsyncCommands, FromRedisValue};
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::error;
+use tokio::sync::mpsc::UnboundedReceiver;
+use uuid::Uuid;
 
 #[derive(Clone)]
 pub struct CollabRedisStream {
   connection_manager: ConnectionManager,
   stream_router: Arc<StreamRouter>,
+  awareness_gossip: Arc<AwarenessGossip>,
 }
 
 impl CollabRedisStream {
@@ -37,20 +40,24 @@ impl CollabRedisStream {
       metrics,
       router_options,
     )?);
+    let awareness_gossip = Arc::new(AwarenessGossip::new(&redis_client).await?);
     let connection_manager = redis_client.get_connection_manager().await?;
     Ok(Self::new_with_connection_manager(
       connection_manager,
       stream_router,
+      awareness_gossip,
     ))
   }
 
   pub fn new_with_connection_manager(
     connection_manager: ConnectionManager,
     stream_router: Arc<StreamRouter>,
+    awareness_gossip: Arc<AwarenessGossip>,
   ) -> Self {
     Self {
       connection_manager,
       stream_router,
+      awareness_gossip,
     }
   }
 
@@ -66,66 +73,38 @@ impl CollabRedisStream {
       .await
   }
 
-  pub async fn collab_control_stream(
+  pub fn collab_update_sink(
     &self,
-    key: &str,
-    group_name: &str,
-  ) -> Result<StreamGroup, StreamError> {
-    let mut group = StreamGroup::new_with_config(
-      key.to_string(),
-      group_name,
+    workspace_id: &Uuid,
+    object_id: &Uuid,
+    collab_type: CollabType,
+  ) -> CollabUpdateSink {
+    let stream_key = UpdateStreamMessage::stream_key(workspace_id);
+    CollabUpdateSink::new(
       self.connection_manager.clone(),
-      StreamConfig::new().with_max_len(1000),
-    );
-
-    // don't return error when create consumer group failed
-    if let Err(err) = group.ensure_consumer_group().await {
-      error!("Failed to ensure consumer group: {}", err);
-    }
-
-    Ok(group)
-  }
-
-  pub async fn collab_update_stream_group(
-    &self,
-    workspace_id: &str,
-    oid: &str,
-    group_name: &str,
-  ) -> Result<StreamGroup, StreamError> {
-    let stream_key = format!("af_collab_update-{}-{}", workspace_id, oid);
-    let mut group = StreamGroup::new_with_config(
       stream_key,
-      group_name,
-      self.connection_manager.clone(),
-      StreamConfig::new()
-        // 2000 messages
-        .with_max_len(2000)
-        // 12 hours
-        .with_expire_time(60 * 60 * 12),
-    );
-    group.ensure_consumer_group().await?;
-    Ok(group)
+      *object_id,
+      collab_type,
+    )
   }
 
-  pub fn collab_update_sink(&self, workspace_id: &str, object_id: &str) -> CollabUpdateSink {
-    let stream_key = CollabStreamUpdate::stream_key(workspace_id, object_id);
-    CollabUpdateSink::new(self.connection_manager.clone(), stream_key)
-  }
-
-  pub fn awareness_update_sink(&self, workspace_id: &str, object_id: &str) -> AwarenessUpdateSink {
-    let stream_key = AwarenessStreamUpdate::stream_key(workspace_id, object_id);
-    AwarenessUpdateSink::new(self.connection_manager.clone(), stream_key)
+  pub async fn awareness_update_sink(
+    &self,
+    workspace_id: &Uuid,
+    object_id: &Uuid,
+  ) -> Result<AwarenessUpdateSink, StreamError> {
+    self.awareness_gossip.sink(workspace_id, object_id).await
   }
 
   /// Reads all collab updates for a given `workspace_id`:`object_id` entry, starting
   /// from a given message id. Once Redis stream return no more results, the stream will be closed.
   pub async fn current_collab_updates(
     &self,
-    workspace_id: &str,
-    object_id: &str,
+    workspace_id: &Uuid,
+    object_id: &Uuid,
     since: Option<MessageId>,
   ) -> Result<Vec<(MessageId, CollabStreamUpdate)>, StreamError> {
-    let stream_key = CollabStreamUpdate::stream_key(workspace_id, object_id);
+    let stream_key = UpdateStreamMessage::stream_key(workspace_id);
     let since = since.unwrap_or_default().to_string();
     let mut conn = self.connection_manager.clone();
     let mut result = Vec::new();
@@ -133,8 +112,23 @@ impl CollabRedisStream {
     if let Some(key) = reply.keys.pop() {
       if key.key == stream_key {
         for stream_id in key.ids {
-          let message_id = MessageId::try_from(stream_id.id)?;
-          let stream_update = CollabStreamUpdate::try_from(stream_id.map)?;
+          let msg_oid = stream_id
+            .map
+            .get("oid")
+            .and_then(|v| Uuid::from_redis_value(v).ok())
+            .unwrap_or_default();
+          if &msg_oid != object_id {
+            continue; // this is not the object we are looking for
+          }
+          let message = UpdateStreamMessage::from_redis_stream(&stream_id.id, &stream_id.map)
+            .map_err(StreamError::Internal)?;
+          let message_id = MessageId::from(message.last_message_id);
+          let stream_update = CollabStreamUpdate::from(message);
+          tracing::trace!(
+            "replaying current collab update `{}` for {}",
+            message_id,
+            msg_oid
+          );
           result.push((message_id, stream_update));
         }
       }
@@ -147,39 +141,43 @@ impl CollabRedisStream {
   /// coming from corresponding Redis stream until explicitly closed.
   pub fn live_collab_updates(
     &self,
-    workspace_id: &str,
-    object_id: &str,
+    workspace_id: &Uuid,
+    object_id: &Uuid,
     since: Option<MessageId>,
   ) -> impl Stream<Item = Result<(MessageId, CollabStreamUpdate), StreamError>> {
-    let stream_key = CollabStreamUpdate::stream_key(workspace_id, object_id);
+    let stream_key = UpdateStreamMessage::stream_key(workspace_id);
     let since = since.map(|id| id.to_string());
-    let mut reader = self.stream_router.observe(stream_key, since);
+    let object_id = *object_id;
+    let mut reader = self
+      .stream_router
+      .observe::<UpdateStreamMessage>(stream_key, since);
     async_stream::try_stream! {
-      while let Some((message_id, fields)) = reader.recv().await {
-        tracing::trace!("incoming collab update `{}`", message_id);
-        let message_id = MessageId::try_from(message_id).map_err(|e| internal(e.to_string()))?;
-        let collab_update = CollabStreamUpdate::try_from(fields)?;
-        yield (message_id, collab_update);
+      while let Some(Ok(msg)) = reader.next().await {
+        if msg.object_id == object_id {
+          let message_id = MessageId::from(msg.last_message_id);
+          let collab_update = CollabStreamUpdate::from(msg);
+          tracing::trace!("incoming collab update `{}`", message_id);
+          yield (message_id, collab_update);
+        }
       }
     }
   }
 
   pub fn awareness_updates(
     &self,
-    workspace_id: &str,
-    object_id: &str,
-    since: Option<MessageId>,
-  ) -> impl Stream<Item = Result<AwarenessStreamUpdate, StreamError>> {
-    let stream_key = AwarenessStreamUpdate::stream_key(workspace_id, object_id);
-    let since = since.map(|id| id.to_string());
-    let mut reader = self.stream_router.observe(stream_key, since);
-    async_stream::try_stream! {
-      while let Some((message_id, fields)) = reader.recv().await {
-        tracing::trace!("incoming awareness update `{}`", message_id);
-        let awareness_update = AwarenessStreamUpdate::try_from(fields)?;
-        yield awareness_update;
-      }
-    }
+    object_id: &Uuid,
+  ) -> UnboundedReceiver<Arc<AwarenessStreamUpdate>> {
+    self.awareness_gossip.collab_awareness_stream(object_id)
+  }
+
+  pub async fn delete_stream_messages(
+    &self,
+    stream_key: &str,
+    message_ids: &[MessageId],
+  ) -> Result<(), StreamError> {
+    let mut conn = self.connection_manager.clone();
+    let _: redis::Value = conn.xdel(stream_key, message_ids).await?;
+    Ok(())
   }
 
   pub async fn prune_update_stream(

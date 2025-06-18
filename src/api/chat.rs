@@ -1,3 +1,4 @@
+use crate::biz::authentication::jwt::UserUuid;
 use crate::biz::chat::ops::{
   create_chat, create_chat_message, delete_chat, generate_chat_message_answer,
   get_chat_messages_with_author_uuid, get_question_message, update_chat_message,
@@ -13,7 +14,7 @@ use appflowy_ai_client::dto::{
   ChatQuestion, ChatQuestionQuery, CreateChatContext, MessageData, QuestionMetadata,
   RepeatedRelatedQuestion,
 };
-use authentication::jwt::UserUuid;
+
 use bytes::Bytes;
 use database::chat;
 use futures::Stream;
@@ -21,8 +22,8 @@ use futures_util::stream;
 use futures_util::{FutureExt, TryStreamExt};
 use pin_project::pin_project;
 use shared_entity::dto::chat_dto::{
-  ChatAuthor, ChatMessage, ChatSettings, CreateAnswerMessageParams, CreateChatMessageParams,
-  CreateChatMessageParamsV2, CreateChatParams, GetChatMessageParams, MessageCursor,
+  ChatAuthor, ChatMessage, ChatMessageWithAuthorUuid, ChatSettings, CreateAnswerMessageParams,
+  CreateChatMessageParams, CreateChatParams, GetChatMessageParams, MessageCursor,
   RepeatedChatMessageWithAuthorUuid, UpdateChatMessageContentParams, UpdateChatParams,
 };
 use shared_entity::response::{AppResponse, JsonAppResponse};
@@ -31,7 +32,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::sync::oneshot;
 use tokio::task;
-use tracing::{error, instrument, trace};
+use tracing::{instrument, trace};
 use uuid::Uuid;
 use validator::Validate;
 pub fn chat_scope() -> Scope {
@@ -66,12 +67,8 @@ pub fn chat_scope() -> Scope {
             .route(web::post().to(create_question_handler))
       )
       .service(
-        web::resource("/{chat_id}/v2/message/question")
-            .route(web::post().to(create_question_handler_v2))
-      )
-      .service(
         web::resource("/{chat_id}/message/answer")
-            .route(web::post().to(save_answer_handler))
+            .route(web::post().to(create_answer_handler))
       )
       .service(
         web::resource("/{chat_id}/message/find_question")
@@ -107,7 +104,7 @@ pub fn chat_scope() -> Scope {
       )
 }
 async fn create_chat_handler(
-  path: web::Path<String>,
+  path: web::Path<Uuid>,
   state: Data<AppState>,
   payload: Json<CreateChatParams>,
 ) -> actix_web::Result<JsonAppResponse<()>> {
@@ -181,46 +178,23 @@ async fn create_question_handler(
   path: web::Path<(String, String)>,
   payload: Json<CreateChatMessageParams>,
   uuid: UserUuid,
-) -> actix_web::Result<JsonAppResponse<ChatMessage>> {
+) -> actix_web::Result<JsonAppResponse<ChatMessageWithAuthorUuid>> {
   let (_workspace_id, chat_id) = path.into_inner();
   let params = payload.into_inner();
 
-  // When create a question, we will extract the metadata from the question content.
-  // metadata might include user mention file,page,or user. For example, @Get started.
-  for metadata in params.metadata.clone() {
-    let (data, desc) = metadata.split_data();
-    if let Err(err) = data.validate() {
-      error!("Failed to validate metadata: {}", err);
-      continue;
-    }
-
-    let context =
-      CreateChatContext::new(chat_id.clone(), data.content_type.to_string(), data.content)
-        .with_metadata(desc);
-    trace!("create context for question: {}", context);
+  if let Some(ref prompt_id) = params.prompt_id {
     state
-      .ai_client
-      .create_chat_text_context(context)
-      .await
-      .map_err(AppError::from)?;
+      .metrics
+      .ai_metrics
+      .record_prompt_usage_count(prompt_id, 1);
   }
 
   let uid = state.user_cache.get_user_uid(&uuid).await?;
-  let resp = create_chat_message(&state.pg_pool, uid, chat_id, params).await?;
+  let resp = create_chat_message(&state.pg_pool, uid, *uuid, chat_id, params).await?;
   Ok(AppResponse::Ok().with_data(resp).into())
 }
 
-#[instrument(level = "debug", skip_all, err)]
-async fn create_question_handler_v2(
-  _state: Data<AppState>,
-  _path: web::Path<(String, String)>,
-  _payload: Json<CreateChatMessageParamsV2>,
-  _uuid: UserUuid,
-) -> actix_web::Result<JsonAppResponse<ChatMessage>> {
-  todo!()
-}
-
-async fn save_answer_handler(
+async fn create_answer_handler(
   path: web::Path<(String, String)>,
   payload: Json<CreateAnswerMessageParams>,
   state: Data<AppState>,
@@ -346,6 +320,7 @@ async fn answer_stream_v2_handler(
       )
     },
     Err(err) => {
+      trace!("[Chat] stream answer failed: {}", err);
       state.metrics.ai_metrics.record_failed_stream_count(1);
       Ok(
         HttpResponse::ServiceUnavailable()

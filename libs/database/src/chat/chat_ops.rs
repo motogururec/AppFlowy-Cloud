@@ -3,8 +3,8 @@ use anyhow::anyhow;
 use app_error::AppError;
 use chrono::{DateTime, Utc};
 use shared_entity::dto::chat_dto::{
-  ChatAuthor, ChatAuthorWithUuid, ChatMessage, ChatMessageMetadata, ChatMessageWithAuthorUuid,
-  ChatSettings, CreateChatParams, GetChatMessageParams, MessageCursor, RepeatedChatMessage,
+  ChatAuthor, ChatAuthorWithUuid, ChatMessage, ChatMessageWithAuthorUuid, ChatSettings,
+  CreateChatParams, GetChatMessageParams, MessageCursor, RepeatedChatMessage,
   RepeatedChatMessageWithAuthorUuid, UpdateChatMessageContentParams, UpdateChatMessageMetaParams,
   UpdateChatParams,
 };
@@ -21,11 +21,10 @@ use uuid::Uuid;
 
 pub async fn insert_chat<'a, E: Executor<'a, Database = Postgres>>(
   executor: E,
-  workspace_id: &str,
+  workspace_id: &Uuid,
   params: CreateChatParams,
 ) -> Result<(), AppError> {
   let chat_id = Uuid::from_str(&params.chat_id)?;
-  let workspace_id = Uuid::from_str(workspace_id)?;
   let rag_ids = json!(params.rag_ids);
   sqlx::query!(
     r#"
@@ -200,22 +199,22 @@ pub async fn insert_answer_message_with_transaction(
   chat_id: &str,
   content: String,
   metadata: serde_json::Value,
-  question_message_id: i64,
+  answer_message_id: i64,
 ) -> Result<ChatMessage, AppError> {
   let chat_id = Uuid::from_str(chat_id)?;
-  let existing_reply_message_id: Option<i64> = sqlx::query_scalar!(
+  let existing_reply_id: Option<i64> = sqlx::query_scalar!(
     r#"
       SELECT reply_message_id
       FROM af_chat_messages
       WHERE message_id = $1
     "#,
-    question_message_id
+    answer_message_id
   )
   .fetch_one(transaction.deref_mut())
   .await?;
 
-  if let Some(reply_id) = existing_reply_message_id {
-    // If there is an existing reply_message_id, update the existing message
+  if let Some(reply_id) = existing_reply_id {
+    // Update the existing reply and RETURN the full row in one go
     sqlx::query!(
       r#"
          UPDATE af_chat_messages
@@ -251,8 +250,8 @@ pub async fn insert_answer_message_with_transaction(
       message_id: row.message_id,
       content: row.content,
       created_at: row.created_at,
-      meta_data: row.meta_data,
-      reply_message_id: Some(question_message_id),
+      metadata: row.meta_data,
+      reply_message_id: Some(answer_message_id),
     };
 
     Ok(chat_message)
@@ -280,19 +279,20 @@ pub async fn insert_answer_message_with_transaction(
         SET reply_message_id = $2
         WHERE message_id = $1
       "#,
-      question_message_id,
+      answer_message_id,
       row.message_id,
     )
     .execute(transaction.deref_mut())
     .await
     .map_err(|err| AppError::Internal(anyhow!("Failed to update reply_message_id: {}", err)))?;
 
+    // For answer message, the reply_message_id will be None
     let chat_message = ChatMessage {
       author,
       message_id: row.message_id,
       content,
       created_at: row.created_at,
-      meta_data: metadata,
+      metadata,
       reply_message_id: None,
     };
 
@@ -329,34 +329,31 @@ pub async fn insert_answer_message(
 
 pub async fn insert_question_message<'a, E: Executor<'a, Database = Postgres>>(
   executor: E,
-  author: ChatAuthor,
+  author: ChatAuthorWithUuid,
   chat_id: &str,
   content: String,
-  metadata: Vec<ChatMessageMetadata>,
-) -> Result<ChatMessage, AppError> {
-  let metadata = json!(metadata);
+) -> Result<ChatMessageWithAuthorUuid, AppError> {
   let chat_id = Uuid::from_str(chat_id)?;
   let row = sqlx::query!(
     r#"
-        INSERT INTO af_chat_messages (chat_id, author, content, meta_data)
-        VALUES ($1, $2, $3, $4)
+        INSERT INTO af_chat_messages (chat_id, author, content)
+        VALUES ($1, $2, $3)
         RETURNING message_id, created_at
         "#,
     chat_id,
     json!(author),
     &content,
-    &metadata,
   )
   .fetch_one(executor)
   .await
   .map_err(|err| AppError::Internal(anyhow!("Failed to insert chat message: {}", err)))?;
 
-  let chat_message = ChatMessage {
+  let chat_message = ChatMessageWithAuthorUuid {
     author,
     message_id: row.message_id,
     content,
+    metadata: json!([]),
     created_at: row.created_at,
-    meta_data: metadata,
     reply_message_id: None,
   };
   Ok(chat_message)
@@ -462,14 +459,14 @@ pub async fn select_chat_messages(
   let messages = rows
     .into_iter()
     .flat_map(
-      |(message_id, content, created_at, author, meta_data, reply_message_id)| {
+      |(message_id, content, created_at, author, metadata, reply_message_id)| {
         match serde_json::from_value::<ChatAuthor>(author) {
           Ok(author) => Some(ChatMessage {
             author,
             message_id,
             content,
             created_at,
-            meta_data,
+            metadata,
             reply_message_id,
           }),
           Err(err) => {
@@ -643,7 +640,7 @@ pub async fn select_chat_messages_with_author_uuid(
   let messages = rows
     .into_iter()
     .flat_map(
-      |(message_id, content, created_at, author, author_uuid, meta_data, reply_message_id)| {
+      |(message_id, content, created_at, author, author_uuid, metadata, reply_message_id)| {
         match serde_json::from_value::<ChatAuthor>(author) {
           Ok(author) => Some(ChatMessageWithAuthorUuid {
             author: ChatAuthorWithUuid {
@@ -654,8 +651,8 @@ pub async fn select_chat_messages_with_author_uuid(
             },
             message_id,
             content,
+            metadata,
             created_at,
-            meta_data,
             reply_message_id,
           }),
           Err(err) => {
@@ -748,7 +745,7 @@ pub async fn get_all_chat_messages<'a, E: Executor<'a, Database = Postgres>>(
           message_id: row.message_id,
           content: row.content,
           created_at: row.created_at,
-          meta_data: row.meta_data,
+          metadata: row.meta_data,
           reply_message_id: row.reply_message_id,
         }),
         Err(err) => {
@@ -883,7 +880,7 @@ pub async fn select_chat_message_matching_reply_message_id(
       message_id: row.message_id,
       content: row.content,
       created_at: row.created_at,
-      meta_data: row.meta_data,
+      metadata: row.meta_data,
       reply_message_id: row.reply_message_id,
     }),
     Err(err) => {
